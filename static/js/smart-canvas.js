@@ -74,6 +74,8 @@ const promptTemplateLibrarySelect = document.getElementById('promptTemplateLibra
 const promptTemplateCats = document.getElementById('promptTemplateCats');
 const promptTemplateBody = document.getElementById('promptTemplateBody');
 const composerTemplateBtn = document.getElementById('composerTemplateBtn');
+const composerClearInheritedBtn = document.getElementById('composerClearInheritedBtn');
+const composerClearOwnBtn = document.getElementById('composerClearOwnBtn');
 let minimapViewport = document.getElementById('minimapViewport');
 let canvas = null;
 let canvasUsesConnections = true;
@@ -162,6 +164,7 @@ let suppressNodeClickUntil = 0;
 let textSelectionGuard = null;
 const UNDO_LIMIT = 40;
 const undoStack = [];
+const redoStack = [];
 let undoSuppressed = false;
 let pendingUndoSnapshot = null;
 let runningHubWorkflowCache = {};
@@ -194,6 +197,7 @@ function commitPendingUndo(){
     if(pendingUndoSnapshot){
         undoStack.push(pendingUndoSnapshot);
         if(undoStack.length > UNDO_LIMIT) undoStack.shift();
+        redoStack.length = 0;
         pendingUndoSnapshot = null;
     }
 }
@@ -212,10 +216,9 @@ function pushUndo(){
     if(!canvas) return;
     undoStack.push(snapshotForUndo());
     if(undoStack.length > UNDO_LIMIT) undoStack.shift();
+    redoStack.length = 0;
 }
-function performUndo(){
-    if(!undoStack.length){ toast(tr('smart.toastNoUndo')); return; }
-    const snap = undoStack.pop();
+function applyHistorySnapshot(snap){
     undoSuppressed = true;
     nodes = snap.nodes;
     if(canvas) canvas.connections = snap.connections;
@@ -227,7 +230,22 @@ function performUndo(){
     render();
     scheduleSave();
     undoSuppressed = false;
+}
+function performUndo(){
+    if(!undoStack.length){ toast(tr('smart.toastNoUndo')); return; }
+    const snap = undoStack.pop();
+    redoStack.push(snapshotForUndo());
+    if(redoStack.length > UNDO_LIMIT) redoStack.shift();
+    applyHistorySnapshot(snap);
     toast(tr('smart.toastUndone'));
+}
+function performRedo(){
+    if(!redoStack.length){ toast(tr('smart.toastNoRedo')); return; }
+    const snap = redoStack.pop();
+    undoStack.push(snapshotForUndo());
+    if(undoStack.length > UNDO_LIMIT) undoStack.shift();
+    applyHistorySnapshot(snap);
+    toast(tr('smart.toastRedone'));
 }
 let comfyWorkflowCache = {};
 let cropState = null;
@@ -2091,8 +2109,13 @@ function arrangeSelectedSmartNodes(){
     scheduleSave();
     toast('已整理选中节点');
 }
+// 节点顶部工具栏 / 底部 composer 在屏幕上的固定显示倍率：>1 让卡片在屏幕上显得更大，=1 为原始 CSS 尺寸。
+const SMART_UI_CARD_SCREEN_SCALE = 1.4;
 function applyViewport(){
     world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`;
+    // 反向缩放因子：供 world 内需要"屏幕尺寸恒定"的卡片（节点顶部浮动工具栏、底部 composer）
+    // 用 scale(boost/zoom) 抵消 world 的缩放，画布缩放时它们的屏幕占比保持不变（CSS 变量继承到子树）。
+    world.style.setProperty('--inv-zoom', String(SMART_UI_CARD_SCREEN_SCALE / (Number(viewport.scale) || 1)));
     // world 被 transform:scale 缩放后，其内部带 backdrop-filter 的卡片（参数设置/合成卡等）
     // 会被部分浏览器（Chrome/Edge 等 Blink 内核）当作独立合成层先按 1x 栅格化、再整体缩放，
     // 缩小时位图被降采样 → 组件发虚。缩放态下关闭这些 backdrop-filter（底色本身已接近不透明，
@@ -5423,6 +5446,7 @@ function applyMergedServerCanvas(serverCanvas){
     if(cleanedState || recoveredLoopOutputs) scheduleSave();
     resumeSmartPendingTasks();
     resumeJimengPendingNodes();
+    resumeSmartTripoTasks();
     return true;
 }
 async function mergeReloadCanvasNow(){
@@ -6038,6 +6062,7 @@ async function loadCanvas(){
         if(cleanedDetachedInputs || cleanedCompletedState || recoveredLoopOutputs || hiddenCompletedTimers) scheduleSave();
         resumeSmartPendingTasks();
         resumeJimengPendingNodes();
+        resumeSmartTripoTasks();
         startCanvasMetaPoll();
     } catch(e) { toast(tr('smart.toastCanvasFail')); }
 }
@@ -6196,6 +6221,343 @@ function createMinimaxNode(x, y, options={}){
     scheduleSave();
     return node;
 }
+function createTripoNode(x, y, options={}){
+    if(!options.skipUndo) pushUndo();
+    const node = {
+        id:uid('tripo'),
+        type:'smart-tripo',
+        x,
+        y,
+        w:420,
+        h:600,
+        title:'Tripo 3D',
+        tripoMode:'multiview',
+        tripoModelVersion:(window.TripoAPI?.MODEL_VERSIONS?.[0]?.id) || 'v2.5-20250123',
+        tripoTexture:true,
+        tripoPbr:true,
+        tripoQuad:false,
+        tripoOrtho:true,
+        tripoTextureQuality:'standard',
+        tripoFaceLimit:'',
+        tripoPrompt:'',
+        tripoViews:{front:'', back:'', left:'', right:''},
+        tripoTaskId:'',
+        tripoTaskStatus:'',
+        tripoProgress:0,
+        tripoResult:null,
+        running:false,
+        created_at:Date.now()
+    };
+    nodes.push(node);
+    if(options.select !== false) selectedId = node.id;
+    render();
+    scheduleSave();
+    return node;
+}
+// —— Tripo 3D 节点（智能画布） ——
+const SMART_TRIPO_SLOTS = [
+    {key:'front', label:'前视图'},
+    {key:'back', label:'后视图'},
+    {key:'left', label:'左视图'},
+    {key:'right', label:'右视图'}
+];
+function smartTripoBodyHtml(node){
+    const mode = node.tripoMode || 'multiview';
+    const versions = window.TripoAPI?.MODEL_VERSIONS || [{id:'v2.5-20250123', label:'Tripo v2.5'}];
+    const views = node.tripoViews || {};
+    const taskActive = node.running || ['queued','running'].includes(node.tripoTaskStatus);
+    const result = node.tripoResult || null;
+    const upstreamCount = inputNodesFor(node).flatMap(n => imagesForNode(n)).filter(img => img?.url).length;
+    const slotHtml = (slot) => {
+        const url = views[slot.key] || '';
+        if(url){
+            return `<div class="tripo-slot filled" data-slot="${slot.key}">
+                <img src="${escapeHtml(url)}" alt="${escapeHtml(slot.label)}" draggable="false">
+                <span class="tripo-slot-tag">${escapeHtml(slot.label)}</span>
+                <button type="button" class="tripo-slot-clear" data-tripo-clear="${slot.key}" title="删除">×</button>
+            </div>`;
+        }
+        return `<div class="tripo-slot" data-slot="${slot.key}">
+            <button type="button" class="tripo-slot-upload" data-tripo-upload="${slot.key}">
+                <i data-lucide="image-plus" class="w-4 h-4"></i><span>${escapeHtml(slot.label)}</span>
+            </button>
+        </div>`;
+    };
+    const modeLabel = (m) => m === 'image' ? '单图' : m === 'text' ? '文生' : '四视图';
+    return `<div class="tripo-body smart-tripo-body">
+        <div class="tripo-mode-tabs">
+            ${['image','multiview','text'].map(m => `<button type="button" data-tripo-mode="${m}" class="${mode === m ? 'active' : ''}">${modeLabel(m)}</button>`).join('')}
+        </div>
+        ${mode === 'multiview' ? `
+        <div class="tripo-view-slots">${SMART_TRIPO_SLOTS.map(slotHtml).join('')}</div>
+        <div class="tripo-linked-hint">空槽位将按顺序使用连线输入图片（当前 ${upstreamCount} 张）</div>` : ''}
+        ${mode === 'image' ? `
+        <div class="tripo-view-slots single">${slotHtml(SMART_TRIPO_SLOTS[0])}</div>
+        <div class="tripo-linked-hint">不上传时使用连线输入的第一张图（当前 ${upstreamCount} 张）</div>` : ''}
+        ${mode === 'text' ? `
+        <textarea class="tripo-prompt-input" rows="3" placeholder="描述要生成的 3D 模型…（可连线 Prompt 节点）">${escapeHtml(node.tripoPrompt || '')}</textarea>` : ''}
+        <div class="tripo-settings">
+            <div class="tripo-settings-row">
+                <select class="tripo-select" data-tripo-field="tripoModelVersion">
+                    ${versions.map(v => `<option value="${escapeHtml(v.id)}" ${node.tripoModelVersion === v.id ? 'selected' : ''}>${escapeHtml(v.label)}</option>`).join('')}
+                </select>
+                <select class="tripo-select" data-tripo-field="tripoTextureQuality" title="贴图质量">
+                    <option value="standard" ${node.tripoTextureQuality !== 'detailed' ? 'selected' : ''}>标准贴图</option>
+                    <option value="detailed" ${node.tripoTextureQuality === 'detailed' ? 'selected' : ''}>高清贴图</option>
+                </select>
+            </div>
+            <div class="tripo-settings-row tripo-checks">
+                <label class="tripo-check"><input type="checkbox" data-tripo-check="tripoTexture" ${node.tripoTexture !== false ? 'checked' : ''}><span>贴图</span></label>
+                <label class="tripo-check"><input type="checkbox" data-tripo-check="tripoPbr" ${node.tripoPbr !== false ? 'checked' : ''}><span>PBR</span></label>
+                <label class="tripo-check"><input type="checkbox" data-tripo-check="tripoQuad" ${node.tripoQuad ? 'checked' : ''}><span>Quad</span></label>
+                ${mode === 'multiview' ? `<label class="tripo-check"><input type="checkbox" data-tripo-check="tripoOrtho" ${node.tripoOrtho !== false ? 'checked' : ''}><span>正交投影</span></label>` : ''}
+            </div>
+        </div>
+        <button type="button" class="tripo-run-btn" data-tripo-run ${node.running ? 'disabled' : ''}>
+            <i data-lucide="box" class="w-4 h-4"></i><span>${node.running ? '生成中…' : '生成 3D 模型'}</span>
+        </button>
+        ${taskActive ? `
+        <div class="tripo-progress">
+            <div class="tripo-progress-track"><div class="tripo-progress-fill" style="width:${Math.max(0, Math.min(100, Number(node.tripoProgress || 0)))}%"></div></div>
+            <div class="tripo-progress-label">${node.tripoTaskStatus === 'queued' ? '排队中' : '生成中'} ${Math.max(0, Math.min(100, Number(node.tripoProgress || 0)))}%</div>
+        </div>` : ''}
+        ${node.tripoError ? `<div class="tripo-error">${escapeHtml(node.tripoError)}</div>` : ''}
+        ${result ? `
+        <div class="tripo-result">
+            <div class="tripo-viewer" data-tripo-viewer-stage="1" data-tripo-viewer-url="${escapeHtml(result.model || '')}"></div>
+            <div class="tripo-result-actions">
+                ${result.model ? `<a class="tripo-action-btn" href="${escapeHtml(result.model)}" download title="下载 GLB"><i data-lucide="download" class="w-3.5 h-3.5"></i><span>GLB</span></a>` : ''}
+                <button type="button" class="tripo-action-btn" data-tripo-retexture ${node.running ? 'disabled' : ''}><i data-lucide="palette" class="w-3.5 h-3.5"></i><span>重贴图</span></button>
+                <select class="tripo-select tripo-convert-format"><option value="GLB">GLB</option><option value="FBX">FBX</option><option value="OBJ">OBJ</option><option value="USDZ">USDZ</option><option value="STL">STL</option></select>
+                <button type="button" class="tripo-action-btn" data-tripo-convert ${node.running ? 'disabled' : ''}><i data-lucide="repeat" class="w-3.5 h-3.5"></i><span>转换</span></button>
+            </div>
+        </div>` : ''}
+    </div>`;
+}
+function smartTripoUpdateProgressDom(node){
+    const el = world.querySelector(`.image-node[data-id="${node.id}"]`);
+    if(!el) return;
+    const fill = el.querySelector('.tripo-progress-fill');
+    const label = el.querySelector('.tripo-progress-label');
+    const pct = Math.max(0, Math.min(100, Number(node.tripoProgress || 0)));
+    if(fill) fill.style.width = `${pct}%`;
+    if(label) label.textContent = `${node.tripoTaskStatus === 'queued' ? '排队中' : '生成中'} ${pct}%`;
+}
+async function smartTripoUploadSlot(node, slot, file){
+    if(!file) return;
+    const form = new FormData();
+    form.append('files', file, file.name || `${slot}.png`);
+    const data = await fetch('/api/ai/upload', {method:'POST', body:form}).then(r => r.json());
+    const url = data.files?.[0]?.url;
+    if(!url) throw new Error('图片上传失败');
+    node.tripoViews = node.tripoViews || {front:'', back:'', left:'', right:''};
+    node.tripoViews[slot] = url;
+    render();
+    scheduleSave();
+}
+async function runSmartTripoNode(nodeId){
+    const node = nodes.find(n => n.id === nodeId);
+    if(!node || node.running) return;
+    const mode = node.tripoMode || 'multiview';
+    const upstreamImages = inputNodesFor(node).flatMap(n => imagesForNode(n)).filter(img => img?.url).map(img => img.url);
+    let fileUrls = [];
+    let prompt = '';
+    if(mode === 'text'){
+        prompt = [node.tripoPrompt || '', (inputPromptTextFor(node) || '').trim()].filter(s => s && s.trim()).join('\n\n').trim();
+        if(!prompt){ toast('请输入提示词或连线 Prompt 节点'); return; }
+    } else if(mode === 'image'){
+        const u = node.tripoViews?.front || upstreamImages[0] || '';
+        if(!u){ toast('请上传图片或连线图片节点'); return; }
+        fileUrls = [u];
+    } else {
+        const views = node.tripoViews || {};
+        let idx = 0;
+        fileUrls = ['front','back','left','right'].map(k => views[k] || upstreamImages[idx++] || '');
+        if(fileUrls.some(u => !u)){ toast('四视图模式需要 4 张图片（前/后/左/右），请上传或连线补足'); return; }
+    }
+    node.running = true;
+    node.tripoError = '';
+    node.tripoTaskStatus = 'queued';
+    node.tripoProgress = 0;
+    node.runStartedAt = Date.now();
+    render();
+    scheduleSave();
+    const startedAt = Date.now();
+    try {
+        let fileTokens = [], fileTypes = [];
+        if(mode !== 'text'){
+            const uploads = await Promise.all(fileUrls.map(u => TripoAPI.uploadImage(u)));
+            fileTokens = uploads.map(x => x.token);
+            fileTypes = uploads.map(x => x.ext);
+        }
+        const payload = {
+            task_type: mode === 'multiview' ? 'multiview_to_model' : mode === 'image' ? 'image_to_model' : 'text_to_model',
+            model_version: node.tripoModelVersion || '',
+            file_tokens: fileTokens,
+            file_types: fileTypes,
+            prompt,
+            texture: node.tripoTexture !== false,
+            pbr: node.tripoPbr !== false,
+            quad: Boolean(node.tripoQuad),
+            texture_quality: node.tripoTextureQuality || 'standard',
+            ortho_projection: node.tripoOrtho !== false
+        };
+        if(node.tripoFaceLimit !== '' && node.tripoFaceLimit != null) payload.face_limit = Number(node.tripoFaceLimit);
+        const created = await TripoAPI.createTask(payload);
+        node.tripoTaskId = created.task_id;
+        node.tripoTaskStatus = 'queued';
+        scheduleSave();
+        const task = await TripoAPI.pollTask(created.task_id, t => {
+            node.tripoTaskStatus = t.status || '';
+            node.tripoProgress = Number(t.progress || 0);
+            smartTripoUpdateProgressDom(node);
+        });
+        node.tripoResult = await TripoAPI.finalizeOutputs(task);
+        node.tripoTaskStatus = '';
+        addSmartGenerationLog({run:{nodeId:node.id, nodeType:node.type, label:'Tripo 3D', startedAt}, outputs:[node.tripoResult.preview || node.tripoResult.model].filter(Boolean), runMs:Date.now() - startedAt});
+        window.TripoUI?.refreshBalance?.();
+    } catch(err){
+        node.tripoError = err.message || String(err);
+        node.tripoTaskStatus = '';
+        addSmartGenerationLog({run:{nodeId:node.id, nodeType:node.type, label:'Tripo 3D', startedAt}, outputs:[], runMs:Date.now() - startedAt, error:node.tripoError});
+        toast(node.tripoError);
+    } finally {
+        node.running = false;
+        render();
+        scheduleSave();
+    }
+}
+async function runSmartTripoPostProcess(node, taskType, extra={}){
+    const originalTaskId = node?.tripoResult?.taskId || node?.tripoTaskId || '';
+    if(!node || !originalTaskId){ toast('请先生成 3D 模型'); return; }
+    if(node.running) return;
+    node.running = true;
+    node.tripoError = '';
+    node.tripoTaskStatus = 'queued';
+    node.tripoProgress = 0;
+    render();
+    scheduleSave();
+    try {
+        const payload = {task_type:taskType, original_task_id:originalTaskId, ...extra};
+        if(taskType === 'texture_model'){
+            payload.texture = true;
+            payload.pbr = node.tripoPbr !== false;
+            payload.texture_quality = node.tripoTextureQuality || 'standard';
+        }
+        const created = await TripoAPI.createTask(payload);
+        node.tripoTaskId = created.task_id;
+        scheduleSave();
+        const task = await TripoAPI.pollTask(created.task_id, t => {
+            node.tripoTaskStatus = t.status || '';
+            node.tripoProgress = Number(t.progress || 0);
+            smartTripoUpdateProgressDom(node);
+        });
+        if(taskType === 'convert_model'){
+            const url = task.output?.model || '';
+            if(!url) throw new Error('转换未返回文件');
+            const dl = await TripoAPI.download(url, `convert_${(extra.format || 'glb').toLowerCase()}`);
+            const a = document.createElement('a');
+            a.href = dl.url;
+            a.download = dl.name || `tripo_convert.${(extra.format || 'glb').toLowerCase()}`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        } else {
+            node.tripoResult = await TripoAPI.finalizeOutputs(task, 'retexture');
+        }
+        node.tripoTaskStatus = '';
+        window.TripoUI?.refreshBalance?.();
+    } catch(err){
+        node.tripoError = err.message || String(err);
+        node.tripoTaskStatus = '';
+        toast(node.tripoError);
+    } finally {
+        node.running = false;
+        render();
+        scheduleSave();
+    }
+}
+function resumeSmartTripoTasks(){
+    nodes.filter(n => n.type === 'smart-tripo' && n.tripoTaskId && ['queued','running'].includes(n.tripoTaskStatus)).forEach(node => {
+        node.running = true;
+        (async () => {
+            try {
+                const task = await TripoAPI.pollTask(node.tripoTaskId, t => {
+                    node.tripoTaskStatus = t.status || '';
+                    node.tripoProgress = Number(t.progress || 0);
+                    smartTripoUpdateProgressDom(node);
+                });
+                node.tripoResult = await TripoAPI.finalizeOutputs(task);
+                node.tripoTaskStatus = '';
+                window.TripoUI?.refreshBalance?.();
+            } catch(err){
+                node.tripoError = err.message || String(err);
+                node.tripoTaskStatus = '';
+            } finally {
+                node.running = false;
+                render();
+                scheduleSave();
+            }
+        })();
+    });
+}
+function bindTripoNodeControls(el, node){
+    el.querySelectorAll('[data-tripo-mode]').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            if(node.tripoMode !== btn.dataset.tripoMode){
+                node.tripoMode = btn.dataset.tripoMode;
+                render();
+                scheduleSave();
+            }
+        };
+    });
+    el.querySelectorAll('[data-tripo-upload]').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            const slot = btn.dataset.tripoUpload;
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = 'image/*';
+            input.onchange = () => {
+                const file = input.files?.[0];
+                if(file) smartTripoUploadSlot(node, slot, file).catch(err => toast(err.message || String(err)));
+            };
+            input.click();
+        };
+    });
+    el.querySelectorAll('[data-tripo-clear]').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            node.tripoViews = node.tripoViews || {};
+            node.tripoViews[btn.dataset.tripoClear] = '';
+            render();
+            scheduleSave();
+        };
+    });
+    el.querySelectorAll('[data-tripo-field]').forEach(sel => {
+        sel.onchange = () => { node[sel.dataset.tripoField] = sel.value; scheduleSave(); };
+    });
+    el.querySelectorAll('[data-tripo-check]').forEach(chk => {
+        chk.onchange = () => { node[chk.dataset.tripoCheck] = chk.checked; scheduleSave(); };
+    });
+    const promptInput = el.querySelector('.tripo-prompt-input');
+    if(promptInput) promptInput.oninput = () => { node.tripoPrompt = promptInput.value; scheduleSave(); };
+    const runBtn = el.querySelector('[data-tripo-run]');
+    if(runBtn) runBtn.onclick = e => { e.stopPropagation(); runSmartTripoNode(node.id); };
+    const retextureBtn = el.querySelector('[data-tripo-retexture]');
+    if(retextureBtn) retextureBtn.onclick = e => { e.stopPropagation(); runSmartTripoPostProcess(node, 'texture_model'); };
+    const convertBtn = el.querySelector('[data-tripo-convert]');
+    if(convertBtn) convertBtn.onclick = e => {
+        e.stopPropagation();
+        const format = el.querySelector('.tripo-convert-format')?.value || 'GLB';
+        runSmartTripoPostProcess(node, 'convert_model', {format});
+    };
+    const stage = el.querySelector('[data-tripo-viewer-stage]');
+    if(stage && node.tripoResult?.model && !stage.querySelector('canvas') && !stage.querySelector('.tripo-viewer-loading')){
+        window.TripoUI?.mountViewer(stage, node.tripoResult.model);
+    }
+}
 function createSmartGroupNode(x, y, options={}){
     if(!options.skipUndo) pushUndo();
     const node = {id:uid('group'), type:'smart-group', x, y, w:SMART_GROUP_DEFAULT_WIDTH, h:SMART_GROUP_DEFAULT_HEIGHT, title:'智能分组', items:[], created_at:Date.now()};
@@ -6216,6 +6578,8 @@ function cloneSmartNode(node, dx=0, dy=0){
             ? 'group'
             : node.type === 'smart-minimax'
             ? 'minimax'
+            : node.type === 'smart-tripo'
+            ? 'tripo'
             : 'smart'
     );
     copy.x = (Number(node.x) || 0) + dx;
@@ -6223,6 +6587,27 @@ function cloneSmartNode(node, dx=0, dy=0){
     clearSmartNodeTransientRunState(copy, {clearRunHistory:true});
     if(copy.type === 'smart-group') copy.title = copy.title || '智能分组';
     return copy;
+}
+// 复制节点时把图片同步写入系统剪贴板，让其他应用（如画图、微信、其他画布网站）也能 Ctrl+V
+async function writeImageToSystemClipboard(url){
+    try {
+        if(!url || !navigator.clipboard?.write || typeof ClipboardItem === 'undefined') return;
+        const blob = await (await fetch(new URL(url, location.href).href)).blob();
+        if(!/^image\//.test(blob.type)) return;
+        let pngBlob = blob;
+        if(blob.type !== 'image/png'){
+            // 剪贴板对 PNG 兼容性最好，其余格式先转码
+            const bmp = await createImageBitmap(blob);
+            const cv = document.createElement('canvas');
+            cv.width = bmp.width;
+            cv.height = bmp.height;
+            cv.getContext('2d').drawImage(bmp, 0, 0);
+            bmp.close?.();
+            pngBlob = await new Promise(resolve => cv.toBlob(resolve, 'image/png'));
+            if(!pngBlob) return;
+        }
+        await navigator.clipboard.write([new ClipboardItem({'image/png': pngBlob})]);
+    } catch(_) { /* 系统剪贴板写入失败不影响页面内复制 */ }
 }
 function copySelectedNodes(){
     if(!canvas || isEditableTarget(document.activeElement)) return;
@@ -6235,6 +6620,8 @@ function copySelectedNodes(){
         nodes:JSON.parse(JSON.stringify(copiedNodes)),
         connections:JSON.parse(JSON.stringify(copiedConnections))
     };
+    const imageNode = copiedNodes.find(n => (n.type === 'smart-image' || !n.type) && Array.isArray(n.images) && n.images.some(img => img?.url));
+    if(imageNode) writeImageToSystemClipboard(imageNode.images.find(img => img?.url).url);
     toast(`已复制 ${copiedNodes.length} 个节点`);
 }
 function pasteNodes(){
@@ -6759,7 +7146,7 @@ function singleMediaHtml(img, w, h){
     return smartPreviewImgHtml(img, 768, `class="node-img" draggable="false" style="width:${w}px;height:${h}px"`);
 }
 function smartNodeHasLiveMedia(node){
-    return Boolean(node?.type === 'smart-minimax' || (!node?.pending && (node?.images || []).some(img => img?.url)));
+    return Boolean(node?.type === 'smart-minimax' || (node?.type === 'smart-tripo' && node?.tripoResult?.model) || (!node?.pending && (node?.images || []).some(img => img?.url)));
 }
 function mediaSignaturePartFromElement(itemEl){
     if(itemEl?.dataset?.mediaSignature) return itemEl.dataset.mediaSignature;
@@ -6802,6 +7189,11 @@ function restoreMediaPlaybackState(media, state){
     else media.addEventListener('loadedmetadata', applyTime, {once:true});
 }
 function transplantSmartMediaElements(oldNodeEl, newNodeEl){
+    const oldTripoStage = oldNodeEl?.querySelector?.('[data-tripo-viewer-stage]');
+    const newTripoStage = newNodeEl?.querySelector?.('[data-tripo-viewer-stage]');
+    if(oldTripoStage && newTripoStage && oldTripoStage.dataset.tripoViewerUrl === newTripoStage.dataset.tripoViewerUrl){
+        newTripoStage.replaceWith(oldTripoStage);
+    }
     const oldStage = oldNodeEl?.querySelector?.('[data-minimax-player-stage]');
     const newStage = newNodeEl?.querySelector?.('[data-minimax-player-stage]');
     if(oldStage && newStage && oldStage.dataset.minimaxPlayerSegment === newStage.dataset.minimaxPlayerSegment && oldStage.dataset.minimaxPlayerUrl === newStage.dataset.minimaxPlayerUrl){
@@ -7271,6 +7663,8 @@ function promptNodeBodyHtml(node){
             <button class="prompt-node-pill prompt-node-control prompt-preset-edit ${templateActive ? 'active' : ''}" type="button"><i data-lucide="library"></i><span>模板库</span></button>
             <button class="prompt-node-pill prompt-node-control prompt-split-toggle ${node.promptSplitEnabled ? 'active' : ''}" type="button"><i data-lucide="split"></i><span>分隔符</span></button>
             <button class="prompt-node-pill prompt-llm-toggle ${node.llmEnabled ? 'active' : ''}" type="button"><i data-lucide="sparkles"></i><span>LLM</span></button>
+            <button class="prompt-node-pill prompt-node-control prompt-clear-inherited" type="button" title="清空继承提示词"><i data-lucide="unlink"></i><span>清空继承</span></button>
+            <button class="prompt-node-pill prompt-node-control prompt-clear-own" type="button" title="清空自带提示词"><i data-lucide="eraser"></i><span>清空自带</span></button>
         </div>
         ${node.promptSplitEnabled ? `<div class="prompt-node-split-row">
             <label class="prompt-node-split-control prompt-node-control"><span>分隔符</span><input class="prompt-node-separator" type="text" value="${escapeHtml(node.promptSeparator)}" maxlength="8" placeholder=";"></label>
@@ -8095,6 +8489,7 @@ function smartMinimaxBodyHtml(node){
 
 function nodeBodyHtml(node, layout){
     if(node.type === 'smart-minimax') return smartMinimaxBodyHtml(node);
+    if(node.type === 'smart-tripo') return smartTripoBodyHtml(node);
     if(node.type === 'smart-group') return smartGroupBodyHtml(node);
     if(node.type === 'smart-prompt') return promptNodeBodyHtml(node);
     if(node.type === 'smart-loop') return smartLoopBodyHtml(node);
@@ -8408,12 +8803,13 @@ function render(){
         .sort((a, b) => (isSmartGroupNode(a) ? 0 : 1) - (isSmartGroupNode(b) ? 0 : 1))
         .map(node => {
         const imgs = node.images || [];
-        const title = node.type === 'smart-group' ? (node.title === '万能分组' ? '智能分组' : (node.title || '智能分组')) : node.type === 'smart-prompt' ? 'Prompt' : node.type === 'smart-loop' ? 'Loop' : node.type === 'smart-minimax' ? 'MiniMax H3' : (imgs.length > 1 ? 'Group' : imgs.length ? 'Image' : escapeHtml(tr('smart.createImportNode')));
+        const title = node.type === 'smart-group' ? (node.title === '万能分组' ? '智能分组' : (node.title || '智能分组')) : node.type === 'smart-prompt' ? 'Prompt' : node.type === 'smart-loop' ? 'Loop' : node.type === 'smart-minimax' ? 'MiniMax H3' : node.type === 'smart-tripo' ? 'Tripo 3D' : (imgs.length > 1 ? 'Group' : imgs.length ? 'Image' : escapeHtml(tr('smart.createImportNode')));
         const scale = nodeScale(node);
         const layout = imageLayout(imgs, scale, node);
         const isPrompt = node.type === 'smart-prompt';
         const isLoop = node.type === 'smart-loop';
         const isMinimax = node.type === 'smart-minimax';
+        const isTripo = node.type === 'smart-tripo';
         const isSmartGroup = node.type === 'smart-group';
         const isCompactMember = isSmartGroupCompactMember(node);
         const isImageNode = node.type === 'smart-image' || !node.type;
@@ -8425,7 +8821,7 @@ function render(){
         const isPending = ((node.pending || isQueued || isJimengPending) && imgs.length === 0);
         const body = nodeBodyHtml(node, layout);
         const deleteBtn = (isGroup || isMinimax) ? '' : `<button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button>`;
-        const hint = isSmartGroup ? '双击添加 · 拖入归组 · 选中后生成' : isMinimax ? 'Timeline editing' : isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
+        const hint = isSmartGroup ? '双击添加 · 拖入归组 · 选中后生成' : isMinimax ? 'Timeline editing' : isTripo ? '图片/提示词连线输入 · 或节点内上传' : isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
         const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isMinimax ? 'minimax-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isCompactMember ? 'smart-group-member-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
 
             <div class="node-head"><div class="node-title">${title}</div><div class="node-actions">${deleteBtn}</div></div>
@@ -8435,7 +8831,7 @@ function render(){
             <div class="node-body">${body}</div>
             ${isCompactMember && (isPrompt || isLoop) ? '<div class="smart-group-member-grab" title="拖动移出分组"></div>' : ''}
             <div class="node-hint">${hint}</div>
-            ${imgs.length || node.pending || isQueued || isJimengPending || isPrompt || isLoop || isMinimax || isSmartGroup ? '<div class="node-resize-handle" data-resize="1"></div>' : ''}
+            ${imgs.length || node.pending || isQueued || isJimengPending || isPrompt || isLoop || isMinimax || isTripo || isSmartGroup ? '<div class="node-resize-handle" data-resize="1"></div>' : ''}
             <div class="node-port port-in" data-port="in" title="input"></div>
             <div class="node-port port-out" data-port="out" title="output"></div>
         </div>`;
@@ -8664,6 +9060,28 @@ function bindPromptNodeControls(el, node){
             node.promptSeparator = promptNodeSeparator(node);
         }
         syncPromptNodeHeightForSplit(node, prevExtra);
+        render();
+        scheduleSave();
+    };
+    const clearInheritedBtn = el.querySelector('.prompt-clear-inherited');
+    if(clearInheritedBtn) clearInheritedBtn.onclick = e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const indices = (canvas?.connections || [])
+            .map((conn, index) => ({conn, index}))
+            .filter(({conn}) => conn.to === node.id && (conn.kind || 'flow') === 'input')
+            .map(({index}) => index);
+        if(indices.length) disconnectConnections(indices);
+    };
+    const clearOwnBtn = el.querySelector('.prompt-clear-own');
+    if(clearOwnBtn) clearOwnBtn.onclick = e => {
+        e.preventDefault();
+        e.stopPropagation();
+        if(!node.text && !node.promptDraftHtml && !node.promptDraftText) return;
+        pushUndo();
+        node.text = '';
+        if('promptDraftHtml' in node) node.promptDraftHtml = '';
+        if('promptDraftText' in node) node.promptDraftText = '';
         render();
         scheduleSave();
     };
@@ -9530,7 +9948,7 @@ function updatePortDragVisual(){
     const fr = nodeRect(fromNode);
     const isOut = portDragState.fromPort === 'out';
     const fx = isOut ? fr.x + fr.width : fr.x;
-    const fy = fr.y + fr.height / 2;
+    const fy = Number.isFinite(portDragState.startY) ? portDragState.startY : fr.y + fr.height / 2;
     const tx = portDragState.currentWorld.x;
     const ty = portDragState.currentWorld.y;
     const dx = Math.max(50, Math.abs(tx - fx) * 0.45);
@@ -9615,6 +10033,7 @@ function bindNodeEvents(){
         if(nodeForControls?.type === 'smart-prompt') bindPromptNodeControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-loop') bindLoopNodeControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-minimax') bindMinimaxNodeControls(el, nodeForControls);
+        if(nodeForControls?.type === 'smart-tripo') bindTripoNodeControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-group') {
             el.ondblclick = e => {
                 e.preventDefault();
@@ -9867,6 +10286,12 @@ function bindNodeEvents(){
             if(!node) return;
             const rect = nodeRect(node);
             resizeState = {id, startX:e.clientX, startY:e.clientY, startW:rect.width, startH:rect.height};
+            // 单张图片/视频节点：锁定画框纵横比，使框始终贴合媒体比例，避免 object-fit:cover 裁掉画面。
+            // 取媒体原始宽高比；拿不到尺寸（如音频卡片）则不锁，保持自由缩放。
+            if(isSmartImageNode(node) && (node.images || []).length === 1 && !isAudioMediaItem(node.images[0])){
+                const sz = mediaLayoutSize(node.images[0]);
+                resizeState.lockRatio = sz.width > 0 && sz.height > 0 ? sz.width / sz.height : rect.width / Math.max(1, rect.height);
+            }
             // 分组缩放：记录本次手势开始时所有成员的位置/尺寸快照与起始缩放，缩放过程按相对快照的比例实时计算，
             // 整体等比缩放+重排。用快照而非持久基准，移动成员后再缩放也不会回退到旧位置。
             if(isSmartGroupNode(node)){
@@ -9896,6 +10321,16 @@ function bindNodeEvents(){
             let node = nodes.find(n => n.id === id);
             if(!node) return;
             if(e.altKey) node = duplicateForAltDrag(node, e.shiftKey);
+            // 拖动即选中：拖到未选中的节点时直接选中它（已是多选成员则保持多选）。
+            // 拖动结束后的 click 会被 suppressNodeClickUntil 抑制，若不在这里选中，浮动菜单/展开面板就不会打开。
+            if(!isNodeSelected(node.id)){
+                selectedId = node.id;
+                selectedIds = [];
+                selectedImage = {nodeId:'', index:-1};
+                if(smartCascadeAnyRunning()) smartCascadeSilentSelection = false;
+                syncSelectionUi();
+                updateComposer();
+            }
             let dragIds = selectedIds.includes(node.id) ? selectedIds.slice() : [node.id];
             if(isSmartGroupNode(node)){
                 const memberIds = smartGroupMembers(node).map(member => member.id);
@@ -9910,6 +10345,21 @@ function bindNodeEvents(){
             capturePendingUndo();
         };
         el.querySelectorAll('.node-port').forEach(port => {
+            // 端口是固定在边缘中点的大热区：鼠标进入时圆钮二维吸附到鼠标位置（--dot-x/--dot-y），离开恢复边缘中点
+            port.addEventListener('mousemove', e => {
+                const r = port.getBoundingClientRect();
+                if(!r.width || !r.height) return;
+                const scaleX = r.width / (port.offsetWidth || 1) || 1;
+                const scaleY = r.height / (port.offsetHeight || 1) || 1;
+                const x = (e.clientX - r.left) / scaleX;
+                const y = (e.clientY - r.top) / scaleY;
+                port.style.setProperty('--dot-x', `${Math.max(10, Math.min((port.offsetWidth || 56) - 10, x))}px`);
+                port.style.setProperty('--dot-y', `${Math.max(10, Math.min((port.offsetHeight || 44) - 10, y))}px`);
+            });
+            port.addEventListener('mouseleave', () => {
+                port.style.removeProperty('--dot-x');
+                port.style.removeProperty('--dot-y');
+            });
             port.addEventListener('mousedown', e => {
                 if(e.button !== 0) return;
                 e.preventDefault(); e.stopPropagation();
@@ -9918,6 +10368,7 @@ function bindNodeEvents(){
                 portDragState = {
                     fromId:id,
                     fromPort:portType,
+                    startY:p.y,
                     currentWorld:p,
                     hoverTargetId:'',
                     hoverPort:'',
@@ -12628,19 +13079,24 @@ async function uploadImageBlobs(blobs){
     const data = await fetch('/api/ai/upload', {method:'POST', body:form}).then(r => r.json());
     return data.files || [];
 }
-function replaceEditedImage(file, extra={}){
-    const {node, index} = currentEditImage();
-    if(!node || !file) return false;
-    node.images[index] = {...(node.images[index] || {}), url:file.url, name:file.name, kind:file.kind || mediaKindForItem(file), natural_w:0, natural_h:0, ...extra};
-    if((node.images || []).length === 1){ delete node.w; delete node.h; }
-    selectedId = node.id; selectedImage = {nodeId:node.id, index};
-    return true;
+// 普通编辑（裁剪/扩图/画笔/缩放）不覆盖原图：结果写到原节点右侧的新节点并连出血缘线（kind=flow，仅表示来源、不作为生成输入），
+// 位置复用生成输出的堆叠逻辑（同一来源的多次编辑自上而下排列），保留完整编辑链可回溯。
+function branchEditedImageToNewNode(file, extra={}, title='Edit'){
+    const {node} = currentEditImage();
+    if(!node || !file) return null;
+    const image = {url:file.url, name:file.name, kind:file.kind || mediaKindForItem(file), natural_w:0, natural_h:0, ...extra};
+    const probe = {type:'smart-image', images:[image]};
+    const layout = imageLayout([image], mediaNodeDefaultScale(probe), probe);
+    const pos = nextOutputPositionForSource(node, {w:layout.width, h:layout.height});
+    const outputNode = createNode(pos.x, pos.y, [image], {select:true});
+    outputNode.title = title;
+    addConnection(node.id, outputNode.id, 'flow');
+    return outputNode;
 }
-function applyOutpaintSizeToSmartParams(width, height){
+function applyOutpaintSizeToSmartParams(subject, width, height){
     const w = Math.max(1, Math.round(Number(width) || 0));
     const h = Math.max(1, Math.round(Number(height) || 0));
     if(!w || !h) return;
-    const subject = currentEditImage().node;
     if(!subject || !isSmartImageNode(subject)) return;
     subject.outpaintSize = {width:w, height:h};
     subject.runSettings = withOutpaintDisplaySettings(subject, cloneSmartSettings(subject.runSettings || settings));
@@ -12663,7 +13119,7 @@ async function applyImageCrop(){
     const blob = await new Promise(resolve => canvasEl.toBlob(resolve, 'image/png'));
     const base = (image.name || 'image').replace(/\.[^.]+$/, '');
     const file = blob ? await uploadCroppedBlob(blob, `${base}_crop.png`) : null;
-    if(file && replaceEditedImage(file)){ closeImageEditor(); render(); scheduleSave(); }
+    if(file && branchEditedImageToNewNode(file, {}, 'Crop')){ closeImageEditor(); render(); scheduleSave(); }
 }
 async function applyImageOutpaint(){
     if(!cropState) return;
@@ -12685,9 +13141,11 @@ async function applyImageOutpaint(){
     const blob = await new Promise(resolve => canvasEl.toBlob(resolve, 'image/png'));
     const base = (image.name || 'image').replace(/\.[^.]+$/, '');
     const file = blob ? await uploadCroppedBlob(blob, `${base}_outpaint.png`) : null;
-    if(file && replaceEditedImage(file)){
-        applyOutpaintSizeToSmartParams(outW, outH);
-        setPromptDraftForNode(node, 'Remove white area and fill the scene');
+    const outputNode = file ? branchEditedImageToNewNode(file, {}, 'Outpaint') : null;
+    if(outputNode){
+        // 扩图参数与填充提示词落到新节点上，原节点保持不变
+        applyOutpaintSizeToSmartParams(outputNode, outW, outH);
+        setPromptDraftForNode(outputNode, 'Remove white area and fill the scene');
         promptInput.dataset.preserveDraftOnce = '1';
         closeImageEditor();
         render();
@@ -12741,7 +13199,7 @@ async function applyImageBrush(){
     const blob = await new Promise(resolve => canvasEl.toBlob(resolve, 'image/png'));
     const base = (image.name || 'image').replace(/\.[^.]+$/, '');
     const file = blob ? await uploadCroppedBlob(blob, `${base}_paint.png`) : null;
-    if(file && replaceEditedImage(file)){ closeImageEditor(); render(); scheduleSave(); }
+    if(file && branchEditedImageToNewNode(file, {}, 'Paint')){ closeImageEditor(); render(); scheduleSave(); }
 }
 async function applyImageGridSplit(){
     if(!cropState) return;
@@ -12772,6 +13230,7 @@ async function applyImageGridSplit(){
             grid:{...layout, row:rects[i]?.row || 0, col:rects[i]?.col || 0, w:rects[i]?.w || 1, h:rects[i]?.h || 1}
         })));
         outputNode.title = 'Grid';
+        addConnection(node.id, outputNode.id, 'flow');
         closeImageEditor(); render(); scheduleSave();
     }
 }
@@ -12848,6 +13307,7 @@ async function applyImageGridJoin(){
             natural_h:canvasEl.height
         }], {select:true, skipUndo:true});
         outputNode.title = 'Grid Join';
+        addConnection(node.id, outputNode.id, 'flow');
         closeImageEditor();
         render();
         scheduleSave();
@@ -12870,7 +13330,7 @@ async function applyImageResize(){
     const suffix = `${Math.round(resized.scale * 100)}pct`;
     const file = await uploadCroppedBlob(resized.blob, `${base}_resize_${suffix}.png`);
     if(!file) return;
-    if(!replaceEditedImage(file, {kind:'image', role:image.role || '', natural_w:resized.targetW, natural_h:resized.targetH})){
+    if(!branchEditedImageToNewNode(file, {kind:'image', role:image.role || '', natural_w:resized.targetW, natural_h:resized.targetH}, 'Resize')){
         return;
     }
     closeImageEditor();
@@ -13023,6 +13483,7 @@ function renderInputThumbsRow(node){
     syncJimengVideoModelPillForRefs();
     const dedup = node ? visibleReferenceImagesFor(node) : [];
     const manualRefKeys = new Set(manualReferenceImagesFor(node).map(img => inputRefKey(img)));
+    const blockedRefKeys = blockedInputRefKeys(node);
     const addActive = mentionInsertMode === 'manual-ref';
     // 仅当参考图集合/状态真正变化时才重建缩略图 DOM。否则每敲一个字都重建并重新解码所有图片，
     // 参考图多时会让输入框打字明显卡顿。
@@ -13030,6 +13491,7 @@ function renderInputThumbsRow(node){
         node: node?.id || '',
         items: dedup.map(img => `${inputRefKey(img)}@${img.url || ''}`),
         manual: [...manualRefKeys],
+        blocked: [...blockedRefKeys],
         add: addActive,
         mode: node ? smartImageMode(node) : ''
     });
@@ -13062,10 +13524,16 @@ function renderInputThumbsRow(node){
         const sourceUrl = img.originalLocalUrl || img.url || '';
         const key = inputRefKey(img);
         const removable = manualRefKeys.has(key);
-        const removeBtn = removable ? `<button class="input-thumb-remove" type="button" data-input-remove-reference="${escapeHtml(inputRefKey(img))}" title="删除参考图" aria-label="删除参考图">×</button>` : '';
-        return `<div class="input-thumb ${isSelf ? 'input-self' : ''} ${removable ? 'input-manual-ref' : ''}" draggable="false" data-thumb-index="${i}" data-node-id="${escapeHtml(img.nodeId || '')}" data-image-index="${img.imageIndex ?? ''}" data-url="${escapeHtml(img.url || '')}" data-source-url="${escapeHtml(sourceUrl)}" title="${escapeHtml(`${img.name || tr('smart.inputNum').replace('{n}', String(i + 1))} · ${title}`)}">${inner}<span class="input-thumb-label">${escapeHtml(label)}</span>${removeBtn}</div>`;
+        const blocked = blockedRefKeys.has(key);
+        // 手动添加的参考图：× 直接移除；上游/自身/提及的输入：× 只是屏蔽（不参与生成），可随时点 + 恢复，
+        // 避免“去掉”后连线还在却没有入口恢复的尴尬状态。
+        const removeBtn = removable
+            ? `<button class="input-thumb-remove" type="button" data-input-remove-reference="${escapeHtml(key)}" title="删除参考图" aria-label="删除参考图">×</button>`
+            : `<button class="input-thumb-remove" type="button" data-input-toggle-block="${i}" title="${blocked ? '恢复该输入' : '去掉该输入（不参与生成）'}" aria-label="${blocked ? '恢复该输入' : '去掉该输入'}">${blocked ? '+' : '×'}</button>`;
+        return `<div class="input-thumb ${isSelf ? 'input-self' : ''} ${removable ? 'input-manual-ref' : ''} ${blocked ? 'input-blocked' : ''}" draggable="false" ${blocked ? 'data-blocked-label="已去掉"' : ''} data-thumb-index="${i}" data-node-id="${escapeHtml(img.nodeId || '')}" data-image-index="${img.imageIndex ?? ''}" data-url="${escapeHtml(img.url || '')}" data-source-url="${escapeHtml(sourceUrl)}" title="${escapeHtml(`${img.name || tr('smart.inputNum').replace('{n}', String(i + 1))} · ${title}`)}">${inner}<span class="input-thumb-label">${escapeHtml(label)}</span>${removeBtn}</div>`;
     }).join('');
-    inputThumbsRow.innerHTML = `<div class="input-thumb-list">${thumbsHtml}${dedup.length > 1 ? `<span class="input-thumb-count">${escapeHtml(tr('smart.inputCount').replace('{n}', String(dedup.length)))}</span>` : ''}</div><div class="input-thumb-actions">${addButton}</div>`;
+    const activeCount = dedup.filter(img => !blockedRefKeys.has(inputRefKey(img))).length;
+    inputThumbsRow.innerHTML = `<div class="input-thumb-list">${thumbsHtml}${activeCount > 1 ? `<span class="input-thumb-count">${escapeHtml(tr('smart.inputCount').replace('{n}', String(activeCount)))}</span>` : ''}</div><div class="input-thumb-actions">${addButton}</div>`;
     bindSmartPreviewImageFallbacks(inputThumbsRow);
     bindInputThumbsDrag(node, dedup, manualRefKeys);
     bindInputThumbReferenceActions();
@@ -13084,6 +13552,20 @@ function bindInputThumbReferenceActions(){
             event.preventDefault();
             event.stopPropagation();
             removeManualReferenceFromSelectedNode(btn.dataset.inputRemoveReference || '');
+        });
+    });
+    inputThumbsRow?.querySelectorAll('[data-input-toggle-block]').forEach(btn => {
+        btn.addEventListener('mousedown', event => {
+            event.preventDefault();
+            event.stopPropagation();
+        }, true);
+        btn.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            const node = selectedNode();
+            if(!node) return;
+            const img = visibleReferenceImagesFor(node)[Number(btn.dataset.inputToggleBlock)];
+            if(img?.url) toggleInputRefBlocked(node, img);
         });
     });
 }
@@ -17444,6 +17926,7 @@ function createNodeFromMenu(type){
     if(type === 'prompt') created = createPromptNode(p.x - 158, p.y - 97);
     else if(type === 'loop') created = createLoopNode(p.x - 135, p.y - 95);
     else if(type === 'minimax') created = createMinimaxNode(p.x - 520, p.y - 320);
+    else if(type === 'tripo') created = createTripoNode(p.x - 210, p.y - 300);
     else created = createImageNodeAt(p);
     createMenuGroupId = groupId;
     addCreatedNodeToMenuGroup(created);
@@ -17494,7 +17977,15 @@ shell.onmousedown = e => {
         updateSelectionBox(e);
         return;
     }
-    if(e.button !== 0 && e.button !== 1) return;
+    if(e.button === 0){
+        // 空白区域普通左键拖动直接框选；中键继续用于画布平移
+        e.preventDefault();
+        didPan = false;
+        selectionState = {startScreen:{x:e.clientX, y:e.clientY}, startWorld:screenToWorld(e)};
+        updateSelectionBox(e);
+        return;
+    }
+    if(e.button !== 1) return;
     e.preventDefault();
     didPan = false;
     panState = {button:e.button, startX:e.clientX, startY:e.clientY, ox:viewport.x, oy:viewport.y};
@@ -17713,8 +18204,22 @@ window.onmousemove = e => {
             updateNodeElementDuringResize(node);
             return;
         }
-        node.w = Math.max(minW, Math.round(resizeState.startW + dx));
-        node.h = Math.max(minH, Math.round(resizeState.startH + dy));
+        if(resizeState.lockRatio > 0 && !e.shiftKey){
+            // 等比缩放：取水平/垂直里相对变化更大的一边作主导轴，另一边按比例推导，
+            // 框始终与媒体同比例，cover 填满后不再裁切。按住 Shift 可临时自由缩放。
+            const ratio = resizeState.lockRatio;
+            const relW = dx / resizeState.startW;
+            const relH = dy / resizeState.startH;
+            let w = Math.abs(relW) >= Math.abs(relH) ? resizeState.startW + dx : (resizeState.startH + dy) * ratio;
+            let h = w / ratio;
+            if(w < minW){ w = minW; h = w / ratio; }
+            if(h < minH){ h = minH; w = h * ratio; }
+            node.w = Math.round(w);
+            node.h = Math.round(h);
+        } else {
+            node.w = Math.max(minW, Math.round(resizeState.startW + dx));
+            node.h = Math.max(minH, Math.round(resizeState.startH + dy));
+        }
         node.scale = 1;
         updateNodeElementDuringResize(node);
         return;
@@ -18132,6 +18637,11 @@ window.addEventListener('keydown', e => {
         closeImageEditor();
         return;
     }
+    if((e.ctrlKey || e.metaKey) && ((e.shiftKey && key === 'z') || key === 'y') && !isEditableTarget(e.target)){
+        e.preventDefault();
+        performRedo();
+        return;
+    }
     if((e.ctrlKey || e.metaKey) && key === 'z' && !isEditableTarget(e.target)){
         e.preventDefault();
         performUndo();
@@ -18383,6 +18893,36 @@ if(composerTemplateBtn) composerTemplateBtn.onclick = event => {
         return;
     }
     openPromptTemplatePanel(activeComposerNode()?.id || selectedNode()?.id || '', promptTemplateSelectedId, {target:'composer'});
+};
+// 清空自带提示词：只清创作区输入框和当前节点的草稿，不断开任何连线
+if(composerClearOwnBtn) composerClearOwnBtn.onclick = event => {
+    event.preventDefault();
+    event.stopPropagation();
+    if(!promptInput?.textContent?.trim() && !activeComposerSubject?.promptDraftHtml && !activeComposerSubject?.promptDraftText) return;
+    pushUndo();
+    clearPromptInput();
+    scheduleSave();
+};
+// 清空继承提示词：只断开指向当前节点的“提示词类”输入连线（prompt/loop/group），图片等素材连线保留
+if(composerClearInheritedBtn) composerClearInheritedBtn.onclick = event => {
+    event.preventDefault();
+    event.stopPropagation();
+    const subject = activeComposerSubject;
+    if(!subject){ toast('请先选择节点'); return; }
+    const promptSourceIds = new Set(promptInputNodesFor(subject).map(n => n.id));
+    if(!promptSourceIds.size){ toast('没有继承提示词'); return; }
+    const indices = (canvas?.connections || [])
+        .map((conn, index) => ({conn, index}))
+        .filter(({conn}) => conn.to === subject.id && promptSourceIds.has(conn.from) && (conn.kind || 'flow') === 'input')
+        .map(({index}) => index);
+    const hasStaleIds = Array.isArray(subject.inputNodeIds) && subject.inputNodeIds.some(id => promptSourceIds.has(id));
+    if(!indices.length && !hasStaleIds){ toast('没有继承提示词'); return; }
+    if(indices.length) disconnectConnections(indices); // 内含 pushUndo/render/scheduleSave
+    if(Array.isArray(subject.inputNodeIds)) subject.inputNodeIds = subject.inputNodeIds.filter(id => !promptSourceIds.has(id));
+    clearDetachedRunInputRefs(subject);
+    renderInputPromptPreview(subject);
+    render();
+    scheduleSave();
 };
 if(promptPresetSelect) promptPresetSelect.onchange = () => renderPromptPresetPanel(promptPresetSelect.value);
 [promptPresetName, promptPresetText].forEach(input => {
@@ -18956,6 +19496,7 @@ window.onload = async () => {
     connectAssetLibrarySyncSocket();
     await loadConfig();
     await loadAssetLibrary();
+    if(window.TripoUI) TripoUI.mountBalance(document.getElementById('tripoBalanceSmart'));
     await loadCanvas();
     syncApiKindToggleVisibility();
     render();

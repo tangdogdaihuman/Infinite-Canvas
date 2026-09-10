@@ -1,0 +1,46 @@
+# Infinite Canvas — 本地 .gitignore
+# 目的：防止把密钥、个人运行数据、素材与生成产物误提交到公开仓库。
+
+# ---------- 密钥 / 凭据 ----------
+# API/.env 是上游用空模板追踪的文件，本地会被填入真实 API key。
+# 已用 `git rm --cached API/.env` 取消追踪（文件仍在本地磁盘上）。
+API/.env
+*.env
+!*.env.example
+
+# ---------- 个人运行数据（画布 / 会话 / 缓存 / 个人配置）----------
+data/canvases/
+data/conversations/
+data/media_previews/
+data/api_providers.json
+data/prompt_libraries.json
+data/projects.json
+data/storage_settings.json
+data/shared_folders.json
+data/runninghub_workflows.json
+history.json
+global_config.json
+server_tripo.log
+
+# ---------- 素材与生成产物（体积大，且含个人内容）----------
+assets/
+output/
+
+# ---------- 内置 Python 运行时 ----------
+# 注意：python/ 下的完整运行时（含 Lib/ 标准库，以及 Lib/site-packages 里
+# 已装好的 fastapi / uvicorn / pydantic / requests / httpx / Pillow 等依赖）
+# 是**故意纳入版本控制**的 —— 目的就是让仓库 clone 下来直接双击 run.bat 就能跑，
+# 不需要任何安装步骤。不要把它们加回 ignore。
+# 唯一被排除的是可再生的字节码缓存，见下面的 __pycache__ 规则。
+
+# ---------- Python 缓存 ----------
+__pycache__/
+*.py[cod]
+
+# ---------- 本地工具链数据 ----------
+.workbuddy/
+
+# ---------- 操作系统杂物 ----------
+Thumbs.db
+Desktop.ini
+.DS_Store

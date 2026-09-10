@@ -1,6 +1,11 @@
 (function(){
     if(!window.StudioI18n) return;
     window.StudioI18n.register({
+        "tripo.noImage": { zh: "缺少图片", en: "Missing image" },
+        "tripo.balanceLoading": { zh: "Tripo 余额加载中", en: "Loading Tripo balance" },
+        "tripo.balanceTitle": { zh: "Tripo 剩余点数（点击刷新）", en: "Tripo credits (click to refresh)" },
+        "tripo.viewerFailed": { zh: "3D 预览加载失败", en: "3D preview failed" },
+        "tripo.modelLoadFailed": { zh: "模型加载失败", en: "Model load failed" },
         "common.apiSettings": { zh: "API 设置", en: "API Settings" },
         "common.comfyuiSettings": { zh: "工作流设置", en: "Workflow Settings" },
         "common.darkMode": { zh: "黑夜模式", en: "Dark Mode" },

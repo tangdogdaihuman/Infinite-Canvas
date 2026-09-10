@@ -461,6 +461,7 @@ const activeCanvasTaskPolls = new Set();
 let hoveredConnectionId = '';
 let lastMouseBoard = {x: 0, y: 0};
 let undoStack = [];
+let redoStack = [];
 const UNDO_MAX = 30;
 const cascadeRunningIds = new Set();
 const cascadeStopIds = new Set();
@@ -953,6 +954,27 @@ async function copyTextToClipboard(text){
         }
     } catch(_) {}
     return false;
+}
+// 复制节点时把图片同步写入系统剪贴板，让其他应用（如画图、微信、其他画布网站）也能 Ctrl+V
+async function writeImageToSystemClipboard(url){
+    try {
+        if(!url || !navigator.clipboard?.write || typeof ClipboardItem === 'undefined') return;
+        const blob = await (await fetch(new URL(url, location.href).href)).blob();
+        if(!/^image\//.test(blob.type)) return;
+        let pngBlob = blob;
+        if(blob.type !== 'image/png'){
+            // 剪贴板对 PNG 兼容性最好，其余格式先转码
+            const bmp = await createImageBitmap(blob);
+            const cv = document.createElement('canvas');
+            cv.width = bmp.width;
+            cv.height = bmp.height;
+            cv.getContext('2d').drawImage(bmp, 0, 0);
+            bmp.close?.();
+            pngBlob = await new Promise(resolve => cv.toBlob(resolve, 'image/png'));
+            if(!pngBlob) return;
+        }
+        await navigator.clipboard.write([new ClipboardItem({'image/png': pngBlob})]);
+    } catch(_) { /* 系统剪贴板写入失败不影响页面内复制 */ }
 }
 function parseRatioValue(value){
     const raw = String(value || '').trim();
@@ -2084,6 +2106,7 @@ async function openCanvas(id){
         renderCanvasList();
         render();
         resumeCanvasImageTasks();
+        resumeTripoTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
     } catch(e) {
@@ -2596,6 +2619,31 @@ function addMsGenNode(point){
         msCustomHeight:'',
         count:1,
         fitImage:false,
+        inputs:[],
+        running:false
+    });
+}
+function addTripoNode(point){
+    const p = point || defaultPoint(150, 0);
+    return addNode({
+        id:uid('tripo'),
+        type:'tripo',
+        x:p.x,
+        y:p.y,
+        tripoMode:'multiview',
+        tripoModelVersion:(window.TripoAPI?.MODEL_VERSIONS?.[0]?.id) || 'v2.5-20250123',
+        tripoTexture:true,
+        tripoPbr:true,
+        tripoQuad:false,
+        tripoOrtho:true,
+        tripoTextureQuality:'standard',
+        tripoFaceLimit:'',
+        tripoPrompt:'',
+        tripoViews:{front:'', back:'', left:'', right:''},
+        tripoTaskId:'',
+        tripoTaskStatus:'',
+        tripoProgress:0,
+        tripoResult:null,
         inputs:[],
         running:false
     });
@@ -3173,6 +3221,410 @@ async function runMsGenNode(nodeId, opts={}){
         alert(err.message || tr('canvas.msFailed'));
     }
 }
+// —— Tripo 3D 生成节点 ——
+const TRIPO_VIEW_SLOTS = [
+    {key:'front', labelKey:'canvas.tripoViewFront', fallback:'前视图'},
+    {key:'back', labelKey:'canvas.tripoViewBack', fallback:'后视图'},
+    {key:'left', labelKey:'canvas.tripoViewLeft', fallback:'左视图'},
+    {key:'right', labelKey:'canvas.tripoViewRight', fallback:'右视图'}
+];
+const tripoPolls = new Set();
+function tripoModeLabel(mode){
+    if(mode === 'image') return tr('canvas.tripoModeImage');
+    if(mode === 'text') return tr('canvas.tripoModeText');
+    return tr('canvas.tripoModeMultiview');
+}
+function tripoUpdateProgressDom(node){
+    const el = nodesEl.querySelector(`.node[data-id="${node.id}"]`);
+    if(!el) return;
+    const fill = el.querySelector('.tripo-progress-fill');
+    const label = el.querySelector('.tripo-progress-label');
+    const pct = Math.max(0, Math.min(100, Number(node.tripoProgress || 0)));
+    if(fill) fill.style.width = `${pct}%`;
+    if(label){
+        const statusText = {queued:tr('canvas.tripoStatusQueued'), running:tr('canvas.tripoStatusRunning')}[node.tripoTaskStatus] || tr('canvas.tripoStatusRunning');
+        label.textContent = `${statusText} ${pct}%`;
+    }
+}
+async function tripoUploadSlotFile(node, slot, file){
+    if(!file) return;
+    const form = new FormData();
+    form.append('files', file, file.name || `${slot}.png`);
+    const data = await fetch('/api/ai/upload', {method:'POST', body:form}).then(r => r.json());
+    const url = data.files?.[0]?.url;
+    if(!url) throw new Error(tr('canvas.tripoUploadFailed'));
+    node.tripoViews = node.tripoViews || {front:'', back:'', left:'', right:''};
+    node.tripoViews[slot] = url;
+    refreshNodes([node.id]);
+    scheduleSave();
+}
+function tripoCollectInputs(node){
+    const mode = node.tripoMode || 'multiview';
+    const sources = orderedSources(node, generatorSources(node));
+    const linkedRefs = imageRefsOnly(sources.flatMap(s => s.refs || []));
+    const linkedPrompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
+    const views = node.tripoViews || {};
+    if(mode === 'text'){
+        return {mode, prompt:[node.tripoPrompt || '', linkedPrompt].filter(s => s && s.trim()).join('\n\n').trim(), fileUrls:[], linkedCount:0};
+    }
+    if(mode === 'image'){
+        const url = views.front || linkedRefs[0]?.url || '';
+        return {mode, prompt:'', fileUrls:url ? [url] : [], linkedCount:linkedRefs.length};
+    }
+    // multiview：槽位优先，空槽按顺序消耗连线图片
+    const slots = TRIPO_VIEW_SLOTS.map(s => s.key);
+    const slotUrls = slots.map(k => views[k] || '');
+    const pool = linkedRefs.map(r => r.url).filter(Boolean);
+    let poolIdx = 0;
+    const fileUrls = slotUrls.map(u => {
+        if(u) return u;
+        return pool[poolIdx++] || '';
+    });
+    return {mode, prompt:'', fileUrls, slotUrls, linkedCount:pool.length, missing:fileUrls.filter(u => !u).length};
+}
+async function pollTripoTask(node, taskId){
+    const key = `${node.id}:${taskId}`;
+    if(tripoPolls.has(key)) throw new Error(tr('canvas.tripoPolling'));
+    tripoPolls.add(key);
+    try {
+        while(true){
+            await new Promise(r => setTimeout(r, 2500));
+            const data = await TripoAPI.queryTask(taskId);
+            const task = data.task || {};
+            node.tripoTaskStatus = task.status || '';
+            node.tripoProgress = Number(task.progress || 0);
+            tripoUpdateProgressDom(node);
+            if(task.status === 'success') return task;
+            if(task.status === 'failed') throw new Error(task.error || task.message || tr('canvas.tripoFailed'));
+            if(task.status === 'cancelled') throw new Error(tr('canvas.tripoCancelled'));
+        }
+    } finally {
+        tripoPolls.delete(key);
+    }
+}
+async function finalizeTripoTask(node, task, kind='model'){
+    const output = task?.output || {};
+    const result = {taskId:task.task_id || node.tripoTaskId || '', model:'', preview:'', remoteModel:output.model || output.pbr_model || output.base_model || ''};
+    const remoteModel = output.pbr_model || output.model || output.base_model || '';
+    if(remoteModel){
+        try {
+            const dl = await TripoAPI.download(remoteModel, kind);
+            result.model = dl.url;
+        } catch(err){ result.model = remoteModel; }
+    }
+    const remotePreview = output.rendered_image || '';
+    if(remotePreview){
+        try {
+            const dl = await TripoAPI.download(remotePreview, 'preview');
+            result.preview = dl.url;
+        } catch(err){ result.preview = remotePreview; }
+    }
+    if(!result.model && !result.preview) throw new Error(tr('canvas.tripoNoOutput'));
+    node.tripoResult = result;
+    return result;
+}
+async function runTripoNode(nodeId, opts={}){
+    const node = nodes.find(n => n.id === nodeId);
+    if(!node || (node.running && !opts.cascade)) return;
+    const startedAt = nowMs();
+    const collected = tripoCollectInputs(node);
+    if(collected.mode === 'text' && !collected.prompt){ alert(tr('canvas.needPrompt')); return; }
+    if(collected.mode === 'image' && !collected.fileUrls.length){ alert(tr('canvas.needImage')); return; }
+    if(collected.mode === 'multiview' && collected.missing){ alert(tr('canvas.tripoNeedFourViews')); return; }
+    const run = runSnapshot(node, collected.prompt || `[Tripo ${collected.mode}]`, []);
+    node.running = true;
+    node.runStatus = 'running';
+    node.runError = '';
+    node.tripoTaskStatus = 'queued';
+    node.tripoProgress = 0;
+    refreshNodes([node.id]);
+    scheduleSave();
+    try {
+        let fileTokens = [], fileTypes = [];
+        if(collected.mode !== 'text'){
+            tripoUpdateProgressDom(node);
+            const uploads = await Promise.all(collected.fileUrls.map(u => TripoAPI.uploadImage(u)));
+            fileTokens = uploads.map(x => x.token);
+            fileTypes = uploads.map(x => x.ext);
+        }
+        const payload = {
+            task_type: collected.mode === 'multiview' ? 'multiview_to_model' : collected.mode === 'image' ? 'image_to_model' : 'text_to_model',
+            model_version: node.tripoModelVersion || '',
+            file_tokens: fileTokens,
+            file_types: fileTypes,
+            prompt: collected.prompt || '',
+            texture: node.tripoTexture !== false,
+            pbr: node.tripoPbr !== false,
+            quad: Boolean(node.tripoQuad),
+            texture_quality: node.tripoTextureQuality || 'standard',
+            ortho_projection: node.tripoOrtho !== false
+        };
+        if(node.tripoFaceLimit !== '' && node.tripoFaceLimit != null) payload.face_limit = Number(node.tripoFaceLimit);
+        const created = await TripoAPI.createTask(payload);
+        node.tripoTaskId = created.task_id;
+        node.tripoTaskStatus = 'queued';
+        scheduleSave();
+        const task = await pollTripoTask(node, created.task_id);
+        const result = await finalizeTripoTask(node, task);
+        node.runStatus = 'done';
+        node.runError = '';
+        addGenerationLog({run, outputs:[result.preview || result.model].filter(Boolean), runMs:nowMs() - startedAt});
+        window.TripoUI?.refreshBalance?.();
+    } catch(err){
+        node.runStatus = 'failed';
+        node.runError = err.message || String(err);
+        node.tripoTaskStatus = '';
+        addGenerationLog({run, outputs:[], runMs:nowMs() - startedAt, error:node.runError});
+        if(opts.cascade) throw err;
+        else alert(node.runError);
+    } finally {
+        node.running = false;
+        refreshNodes([node.id]);
+        scheduleSave();
+    }
+}
+async function runTripoPostProcess(nodeId, taskType, extra={}){
+    const node = nodes.find(n => n.id === nodeId);
+    const originalTaskId = node?.tripoResult?.taskId || node?.tripoTaskId || '';
+    if(!node || !originalTaskId){ alert(tr('canvas.tripoNeedResult')); return; }
+    if(node.running) return;
+    node.running = true;
+    node.runStatus = 'running';
+    node.runError = '';
+    node.tripoTaskStatus = 'queued';
+    node.tripoProgress = 0;
+    refreshNodes([node.id]);
+    scheduleSave();
+    try {
+        const payload = {task_type:taskType, original_task_id:originalTaskId, ...extra};
+        if(taskType === 'texture_model'){
+            payload.texture = true;
+            payload.pbr = node.tripoPbr !== false;
+            payload.texture_quality = node.tripoTextureQuality || 'standard';
+        }
+        const created = await TripoAPI.createTask(payload);
+        node.tripoTaskId = created.task_id;
+        scheduleSave();
+        const task = await pollTripoTask(node, created.task_id);
+        if(taskType === 'convert_model'){
+            const output = task.output || {};
+            const url = output.model || '';
+            if(!url) throw new Error(tr('canvas.tripoNoOutput'));
+            const dl = await TripoAPI.download(url, `convert_${(extra.format || 'glb').toLowerCase()}`);
+            const a = document.createElement('a');
+            a.href = dl.url;
+            a.download = dl.name || `tripo_convert.${(extra.format || 'glb').toLowerCase()}`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        } else {
+            await finalizeTripoTask(node, task, 'retexture');
+        }
+        node.runStatus = 'done';
+        window.TripoUI?.refreshBalance?.();
+    } catch(err){
+        node.runStatus = 'failed';
+        node.runError = err.message || String(err);
+        node.tripoTaskStatus = '';
+        alert(node.runError);
+    } finally {
+        node.running = false;
+        refreshNodes([node.id]);
+        scheduleSave();
+    }
+}
+function resumeTripoTasks(){
+    nodes.filter(n => n.type === 'tripo' && n.tripoTaskId && ['queued','running'].includes(n.tripoTaskStatus)).forEach(node => {
+        node.runStatus = 'running';
+        (async () => {
+            try {
+                const task = await pollTripoTask(node, node.tripoTaskId);
+                await finalizeTripoTask(node, task);
+                node.runStatus = 'done';
+                node.runError = '';
+                window.TripoUI?.refreshBalance?.();
+            } catch(err){
+                node.runStatus = 'failed';
+                node.runError = err.message || String(err);
+                node.tripoTaskStatus = '';
+            } finally {
+                node.running = false;
+                refreshNodes([node.id]);
+                scheduleSave();
+            }
+        })();
+    });
+}
+function renderTripoBody(node){
+    const wrap = document.createElement('div');
+    wrap.className = 'generator-body tripo-body';
+    const mode = node.tripoMode || 'multiview';
+    const versions = window.TripoAPI?.MODEL_VERSIONS || [{id:'v2.5-20250123', label:'Tripo v2.5'}];
+    const views = node.tripoViews || {};
+    const collected = tripoCollectInputs(node);
+    const taskActive = node.running || ['queued','running'].includes(node.tripoTaskStatus);
+    const result = node.tripoResult || null;
+    const slotHtml = (slot) => {
+        const url = views[slot.key] || '';
+        const label = tr(slot.labelKey) !== slot.labelKey ? tr(slot.labelKey) : slot.fallback;
+        if(url){
+            return `<div class="tripo-slot filled" data-slot="${slot.key}">
+                <img src="${escapeAttr(url)}" alt="${escapeAttr(label)}" draggable="false">
+                <span class="tripo-slot-tag">${escapeHtml(label)}</span>
+                <button type="button" class="tripo-slot-clear" data-clear-slot="${slot.key}" title="${tr('common.delete')}">×</button>
+            </div>`;
+        }
+        return `<div class="tripo-slot" data-slot="${slot.key}">
+            <button type="button" class="tripo-slot-upload" data-upload-slot="${slot.key}">
+                <i data-lucide="image-plus" class="w-4 h-4"></i><span>${escapeHtml(label)}</span>
+            </button>
+        </div>`;
+    };
+    wrap.innerHTML = `
+        <div class="ms-model-tabs">
+            ${['image','multiview','text'].map(m => `<button type="button" data-tmode="${m}" class="${mode === m ? 'active' : ''}">${escapeHtml(tripoModeLabel(m))}</button>`).join('')}
+        </div>
+        <div class="ms-content">
+            ${mode === 'multiview' ? `
+            <div class="tripo-view-slots">${TRIPO_VIEW_SLOTS.map(slotHtml).join('')}</div>
+            <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mt-2 mb-1">${tr('canvas.tripoLinkedHint')} (${collected.linkedCount || 0})</div>
+            <div class="input-list tripo-img-list"></div>
+            ` : ''}
+            ${mode === 'image' ? `
+            <div class="tripo-view-slots single">${slotHtml(TRIPO_VIEW_SLOTS[0])}</div>
+            <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mt-2 mb-1">${tr('canvas.images')}</div>
+            <div class="input-list tripo-img-list"></div>
+            ` : ''}
+            ${mode === 'text' ? `
+            <div class="prompt-list mt-1 mb-1"></div>
+            <textarea class="setting-input tripo-prompt-input" rows="3" placeholder="${escapeAttr(tr('canvas.tripoPromptPlaceholder'))}">${escapeHtml(node.tripoPrompt || '')}</textarea>
+            ` : ''}
+        </div>
+        <div class="ms-controls">
+            <div class="gen-settings">
+                <div class="gen-settings-row">
+                    <select class="select-lite tripo-version-select" style="flex:1">
+                        ${versions.map(v => `<option value="${escapeAttr(v.id)}" ${node.tripoModelVersion === v.id ? 'selected' : ''}>${escapeHtml(v.label)}</option>`).join('')}
+                    </select>
+                    <select class="select-lite tripo-quality-select" title="${escapeAttr(tr('canvas.tripoTextureQuality'))}">
+                        <option value="standard" ${node.tripoTextureQuality !== 'detailed' ? 'selected' : ''}>${tr('canvas.tripoQualityStandard')}</option>
+                        <option value="detailed" ${node.tripoTextureQuality === 'detailed' ? 'selected' : ''}>${tr('canvas.tripoQualityDetailed')}</option>
+                    </select>
+                </div>
+                <div class="gen-settings-row tripo-checks">
+                    <label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoTexture" ${node.tripoTexture !== false ? 'checked' : ''}><span>${tr('canvas.tripoTexture')}</span></label>
+                    <label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoPbr" ${node.tripoPbr !== false ? 'checked' : ''}><span>PBR</span></label>
+                    <label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoQuad" ${node.tripoQuad ? 'checked' : ''}><span>Quad</span></label>
+                    ${mode === 'multiview' ? `<label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoOrtho" ${node.tripoOrtho !== false ? 'checked' : ''}><span>${tr('canvas.tripoOrtho')}</span></label>` : ''}
+                </div>
+                <div class="gen-settings-row">
+                    <label class="field" style="flex:1">
+                        <div class="setting-title">${tr('canvas.tripoFaceLimit')}</div>
+                        <input class="setting-input tripo-face-input" type="number" min="1000" step="1000" value="${escapeAttr(node.tripoFaceLimit || '')}" placeholder="Auto">
+                    </label>
+                </div>
+            </div>
+            <div class="gen-run-row">
+                <button class="gen-btn tripo-run-btn ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}>
+                    <i data-lucide="box" class="w-4 h-4"></i>${node.running ? tr('canvas.generating') : tr('canvas.tripoGenerate')}
+                </button>
+                ${cascadeBtnHtml(node)}
+            </div>
+            ${retryBarHtml(node)}
+            ${taskActive ? `
+            <div class="tripo-progress">
+                <div class="tripo-progress-track"><div class="tripo-progress-fill" style="width:${Math.max(0, Math.min(100, Number(node.tripoProgress || 0)))}%"></div></div>
+                <div class="tripo-progress-label">${escapeHtml(({queued:tr('canvas.tripoStatusQueued'), running:tr('canvas.tripoStatusRunning')}[node.tripoTaskStatus]) || tr('canvas.tripoStatusRunning'))} ${Math.max(0, Math.min(100, Number(node.tripoProgress || 0)))}%</div>
+            </div>` : ''}
+            ${result ? `
+            <div class="tripo-result">
+                <div class="tripo-viewer"></div>
+                <div class="tripo-result-actions">
+                    ${result.model ? `<a class="secondary-btn tripo-download-btn" href="${escapeAttr(result.model)}" download title="${escapeAttr(result.model)}"><i data-lucide="download" class="w-3.5 h-3.5"></i><span>GLB</span></a>` : ''}
+                    <button type="button" class="secondary-btn tripo-retexture-btn" ${node.running ? 'disabled' : ''}><i data-lucide="palette" class="w-3.5 h-3.5"></i><span>${tr('canvas.tripoRetexture')}</span></button>
+                    <span class="tripo-convert-group">
+                        <select class="select-lite tripo-convert-format">
+                            <option value="GLB">GLB</option><option value="FBX">FBX</option><option value="OBJ">OBJ</option><option value="USDZ">USDZ</option><option value="STL">STL</option>
+                        </select>
+                        <button type="button" class="secondary-btn tripo-convert-btn" ${node.running ? 'disabled' : ''}><i data-lucide="repeat" class="w-3.5 h-3.5"></i><span>${tr('canvas.tripoConvert')}</span></button>
+                    </span>
+                </div>
+            </div>` : ''}
+        </div>
+    `;
+    // 输入列表与提示词预览
+    const sources = orderedSources(node, generatorSources(node));
+    const imageInputs = sources.map(src => ({...src, refs:imageRefsOnly(src.refs || [])})).filter(src => src.refs?.length);
+    renderImageInputList(wrap.querySelector('.tripo-img-list'), node, imageInputs, tr('canvas.tripoLinkedEmpty'));
+    renderPromptPreview(wrap.querySelector('.prompt-list'), sources.filter(src => src.prompt && !src.refs?.length));
+    // 事件绑定
+    wrap.querySelectorAll('[data-tmode]').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            if(node.tripoMode !== btn.dataset.tmode){
+                node.tripoMode = btn.dataset.tmode;
+                refreshNodes([node.id]);
+                scheduleSave();
+            }
+        };
+    });
+    wrap.querySelectorAll('[data-upload-slot]').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            const slot = btn.dataset.uploadSlot;
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = 'image/*';
+            input.onchange = () => {
+                const file = input.files?.[0];
+                if(file) tripoUploadSlotFile(node, slot, file).catch(err => alert(err.message || String(err)));
+            };
+            input.click();
+        };
+    });
+    wrap.querySelectorAll('[data-clear-slot]').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            node.tripoViews = node.tripoViews || {};
+            node.tripoViews[btn.dataset.clearSlot] = '';
+            refreshNodes([node.id]);
+            scheduleSave();
+        };
+    });
+    const versionSelect = wrap.querySelector('.tripo-version-select');
+    if(versionSelect) versionSelect.onchange = () => { node.tripoModelVersion = versionSelect.value; scheduleSave(); };
+    const qualitySelect = wrap.querySelector('.tripo-quality-select');
+    if(qualitySelect) qualitySelect.onchange = () => { node.tripoTextureQuality = qualitySelect.value; scheduleSave(); };
+    wrap.querySelectorAll('.tripo-check').forEach(chk => {
+        chk.onchange = () => { node[chk.dataset.field] = chk.checked; scheduleSave(); };
+    });
+    const faceInput = wrap.querySelector('.tripo-face-input');
+    if(faceInput) faceInput.onchange = () => { node.tripoFaceLimit = faceInput.value; scheduleSave(); };
+    const promptInput = wrap.querySelector('.tripo-prompt-input');
+    if(promptInput) promptInput.oninput = () => { node.tripoPrompt = promptInput.value; scheduleSave(); };
+    const runBtn = wrap.querySelector('.tripo-run-btn');
+    if(runBtn){
+        runBtn.onmousedown = e => e.stopPropagation();
+        runBtn.onclick = e => { e.stopPropagation(); runTripoNode(node.id); };
+    }
+    const retextureBtn = wrap.querySelector('.tripo-retexture-btn');
+    if(retextureBtn) retextureBtn.onclick = e => { e.stopPropagation(); runTripoPostProcess(node.id, 'texture_model'); };
+    const convertBtn = wrap.querySelector('.tripo-convert-btn');
+    if(convertBtn) convertBtn.onclick = e => {
+        e.stopPropagation();
+        const format = wrap.querySelector('.tripo-convert-format')?.value || 'GLB';
+        runTripoPostProcess(node.id, 'convert_model', {format});
+    };
+    bindCascadeButtons(wrap, node.id);
+    // 3D 预览
+    if(result?.model){
+        setTimeout(() => {
+            const container = nodesEl.querySelector(`.node[data-id="${node.id}"] .tripo-viewer`);
+            if(container) window.TripoUI?.mountViewer(container, result.model);
+        }, 60);
+    }
+    return wrap;
+}
 function addComfyNode(point){
     const p = point || defaultPoint(160, 0);
     return addNode({
@@ -3231,6 +3683,7 @@ function linkCreateOptions(state){
                 {type:'generator', label:tr('canvas.apiGenerate'), icon:'wand-sparkles'},
                 {type:'midjourney', label:'Midjourney', icon:'panel-top'},
                 {type:'msgen', label:tr('canvas.modelscopeGenerate'), icon:'cloud-lightning'},
+                {type:'tripo', label:'Tripo 3D', icon:'box'},
                 {type:'comfy', label:tr('canvas.comfyGenerate'), icon:'workflow'},
                 {type:'rh', label:tr('canvas.rhGenerate'), icon:'workflow'},
                 {type:'minimax', label:'MiniMax H3', icon:'sparkles'},
@@ -3609,6 +4062,7 @@ function createNodeByType(type, point){
     if(type === 'generator') return addGeneratorNode(point);
     if(type === 'midjourney') return addMidjourneyNode(point);
     if(type === 'msgen') return addMsGenNode(point);
+    if(type === 'tripo') return addTripoNode(point);
     if(type === 'video') return addVideoNode(point);
     if(type === 'minimax') return addMiniMaxNode(point);
     if(type === 'rh') return addRhNode(point);
@@ -3626,6 +4080,7 @@ function menuAdd(type){
     if(type === 'generator') addGeneratorNode(menuPoint);
     if(type === 'midjourney') addMidjourneyNode(menuPoint);
     if(type === 'msgen') addMsGenNode(menuPoint);
+    if(type === 'tripo') addTripoNode(menuPoint);
     if(type === 'video') addVideoNode(menuPoint);
     if(type === 'minimax') addMiniMaxNode(menuPoint);
     if(type === 'rh') addRhNode(menuPoint);
@@ -6151,10 +6606,10 @@ function renderNode(node){
         if(node.type === 'output') openOutputNodeMenu(node.id, e.clientX, e.clientY);
         else openGeneratorNodeMenu(node.id, e.clientX, e.clientY);
     };
-    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'minimax' ? 'MiniMax H3' : node.type === 'midjourney' ? 'Midjourney' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
+    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'minimax' ? 'MiniMax H3' : node.type === 'midjourney' ? 'Midjourney' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'tripo' ? 'Tripo 3D' : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
     const displayTitle = node.type === 'image' && node.url ? nodeTitleForMedia(node) : title;
     // 失败徽章只在一键运行模式中显示，单节点失败已通过 alert 提示
-    const showStatus = ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh','minimax'].includes(node.type) && node.runStatus
+    const showStatus = ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh','minimax','tripo'].includes(node.type) && node.runStatus
         && (node.runStatus !== 'failed' || node._cascadeFailed);
     const statusHtml = showStatus ? (() => {
         const label = { queued:'排队中', running:'运行中', done:'完成', failed:'失败' }[node.runStatus] || '';
@@ -6254,9 +6709,36 @@ function renderNode(node){
     }
     if(node.type === 'prompt') {
         const templateActive = promptTemplateModal?.classList.contains('open') && promptTemplateNodeId === node.id;
-        body.innerHTML = `<div class="prompt-editor"><div class="prompt-toolbar"><button class="prompt-template-btn ${templateActive ? 'active' : ''}" type="button" data-prompt-template-open data-prompt-template-node-id="${escapeAttr(node.id)}" aria-pressed="${templateActive ? 'true' : 'false'}" title="${escapeAttr(tr('canvas.promptTemplateLibrary'))}"><i data-lucide="library"></i><span>${escapeHtml(tr('canvas.promptTemplateShort'))}</span></button>${promptCounterHtml(node.text || '')}</div><textarea placeholder="${tr('canvas.promptPlaceholder')}">${escapeHtml(node.text || '')}</textarea></div>`;
+        body.innerHTML = `<div class="prompt-editor"><div class="prompt-toolbar"><button class="prompt-template-btn ${templateActive ? 'active' : ''}" type="button" data-prompt-template-open data-prompt-template-node-id="${escapeAttr(node.id)}" aria-pressed="${templateActive ? 'true' : 'false'}" title="${escapeAttr(tr('canvas.promptTemplateLibrary'))}"><i data-lucide="library"></i><span>${escapeHtml(tr('canvas.promptTemplateShort'))}</span></button><button class="prompt-template-btn" type="button" data-prompt-clear-inherited title="清空继承提示词"><i data-lucide="unlink"></i><span>清空继承</span></button><button class="prompt-template-btn" type="button" data-prompt-clear-own title="清空自带提示词"><i data-lucide="eraser"></i><span>清空自带</span></button>${promptCounterHtml(node.text || '')}</div><textarea placeholder="${tr('canvas.promptPlaceholder')}">${escapeHtml(node.text || '')}</textarea></div>`;
         const textarea = body.querySelector('textarea');
         const templateBtn = body.querySelector('[data-prompt-template-open]');
+        const clearInheritedBtn = body.querySelector('[data-prompt-clear-inherited]');
+        const clearOwnBtn = body.querySelector('[data-prompt-clear-own]');
+        clearInheritedBtn.onclick = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            const removed = connections.some(c => c.to === node.id);
+            if(!removed) return;
+            pushUndo();
+            connections = connections.filter(c => c.to !== node.id);
+            syncGeneratorInputs();
+            refreshGeneratorInputViews();
+            render();
+            scheduleSave();
+        };
+        clearOwnBtn.onclick = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            if(!node.text && !node.promptDraftHtml && !node.promptDraftText) return;
+            pushUndo();
+            node.text = '';
+            if('promptDraftHtml' in node) node.promptDraftHtml = '';
+            if('promptDraftText' in node) node.promptDraftText = '';
+            textarea.value = '';
+            refreshPromptCounter(body, '');
+            scheduleSave();
+            scheduleGeneratorInputSync();
+        };
         templateBtn.onclick = e => {
             e.preventDefault();
             e.stopPropagation();
@@ -6308,6 +6790,7 @@ function renderNode(node){
     if(node.type === 'generator') body.appendChild(renderGeneratorBody(node));
     if(node.type === 'midjourney') body.appendChild(renderMidjourneyBody(node));
     if(node.type === 'msgen') body.appendChild(renderMsGenBody(node));
+    if(node.type === 'tripo') body.appendChild(renderTripoBody(node));
     if(node.type === 'video') body.appendChild(renderVideoBody(node));
     if(node.type === 'minimax') body.appendChild(renderMiniMaxBody(node));
     if(node.type === 'rh') body.appendChild(renderRhBody(node));
@@ -6332,8 +6815,8 @@ function renderNode(node){
         if(e.button !== 0 || !isNodeDragSurface(e.target)) return;
         startNodeDrag(e, node);
     };
-    const canInput = ['generator','midjourney','comfy','ltxDirector','output','llm','msgen','video','rh','minimax'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
-    const canOutput = ['image','prompt','loop','group','promptGroup','generator','midjourney','comfy','ltxDirector','llm','msgen','video','rh','minimax','output'].includes(node.type);
+    const canInput = ['generator','midjourney','comfy','ltxDirector','output','llm','msgen','video','rh','minimax','tripo'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
+    const canOutput = ['image','prompt','loop','group','promptGroup','generator','midjourney','comfy','ltxDirector','llm','msgen','video','rh','minimax','tripo','output'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(canOutput) el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
     el.insertAdjacentHTML('beforeend', `<div class="resize-handle" title="${tr('canvas.resize')}"></div>`);
@@ -6351,10 +6834,28 @@ function renderNode(node){
     };
     el.querySelector('.resize-handle').onmousedown = e => { if(e.button === 0 && !e.shiftKey) startNodeResize(e, node); };
     el.ondragstart = e => { e.preventDefault(); e.stopPropagation(); };
-    const out = el.querySelector('.port.out');
-    if(out) out.onmousedown = e => { if(e.button === 0 && !e.shiftKey) startLink(e, node.id, 'out'); };
-    const inp = el.querySelector('.port.in');
-    if(inp) inp.onmousedown = e => { if(e.button === 0 && !e.shiftKey) startLink(e, node.id, 'in'); };
+    // 端口是一个固定在边缘中点的大热区：鼠标进入热区时可见圆点二维吸附到鼠标位置（--dot-x/--dot-y），
+    // 按下热区任意位置即可拖出连线，离开热区圆点回到边缘中点。
+    const bindPortMagnet = (port, kind) => {
+        if(!port) return;
+        port.addEventListener('mousemove', e => {
+            const r = port.getBoundingClientRect();
+            if(!r.width || !r.height) return;
+            const scaleX = r.width / (port.offsetWidth || 1) || 1;
+            const scaleY = r.height / (port.offsetHeight || 1) || 1;
+            const x = (e.clientX - r.left) / scaleX;
+            const y = (e.clientY - r.top) / scaleY;
+            port.style.setProperty('--dot-x', `${Math.max(10, Math.min((port.offsetWidth || 64) - 10, x))}px`);
+            port.style.setProperty('--dot-y', `${Math.max(10, Math.min((port.offsetHeight || 44) - 10, y))}px`);
+        });
+        port.addEventListener('mouseleave', () => {
+            port.style.removeProperty('--dot-x');
+            port.style.removeProperty('--dot-y');
+        });
+        port.onmousedown = e => { if(e.button === 0 && !e.shiftKey) startLink(e, node.id, kind); };
+    };
+    bindPortMagnet(el.querySelector('.port.out'), 'out');
+    bindPortMagnet(el.querySelector('.port.in'), 'in');
     return el;
 }
 function bindOutputWrap(wrap, node){
@@ -6519,6 +7020,7 @@ function defaultNodeSize(type){
     if(type === 'generator') return {w:380, h:0};
     if(type === 'midjourney') return {w:380, h:0};
     if(type === 'msgen') return {w:380, h:0};
+    if(type === 'tripo') return {w:400, h:0};
     if(type === 'video') return {w:400, h:0};
     if(type === 'minimax') return {w:980, h:720};
     if(type === 'rh') return {w:430, h:0};
@@ -11031,7 +11533,7 @@ function updateComfyField(node, input, event){
     scheduleSave();
 }
 
-const CANVAS_GENERATOR_TYPES = ['generator','midjourney','msgen','comfy','ltxDirector','video','rh','minimax'];
+const CANVAS_GENERATOR_TYPES = ['generator','midjourney','msgen','comfy','ltxDirector','video','rh','minimax','tripo'];
 const CANVAS_IMAGE_OUTPUT_TYPES = ['generator','midjourney','msgen','comfy','ltxDirector','rh'];
 const CANVAS_MEDIA_OUTPUT_TYPES = ['generator','midjourney','msgen','comfy','ltxDirector','video','rh','minimax'];
 function hasExplicitOutputConnection(nodeId){
@@ -11278,6 +11780,10 @@ function refreshGeneratorInputViews(){
         if(gen.type === 'generator') renderImageInputList(el.querySelector('.input-list'), gen, imageInputs);
         if(gen.type === 'midjourney') renderImageInputList(el.querySelector('.mj-input-list'), gen, imageInputs);
         if(gen.type === 'msgen') renderImageInputList(el.querySelector('.ms-img-list'), gen, imageInputs);
+        if(gen.type === 'tripo'){
+            renderImageInputList(el.querySelector('.tripo-img-list'), gen, imageInputs, tr('canvas.tripoLinkedEmpty'));
+            renderPromptPreview(el.querySelector('.prompt-list'), sources.filter(src => src.prompt && !src.refs?.length));
+        }
         if(gen.type === 'comfy') renderComfyImages(el.querySelector('.input-list'), gen, imageInputs);
         if(gen.type === 'ltxDirector'){
             ltxSyncConnectedImagesToTimeline(gen);
@@ -12875,6 +13381,7 @@ function runCascadeNodeByType(node, opts={}){
     if(node.type === 'generator') return runGenerator(node.id, runOpts);
     if(node.type === 'midjourney') return runMidjourneyNode(node.id, runOpts);
     if(node.type === 'msgen') return runMsGenNode(node.id, runOpts);
+    if(node.type === 'tripo') return runTripoNode(node.id, runOpts);
     if(node.type === 'comfy') return runComfyNode(node.id, runOpts);
     if(node.type === 'ltxDirector') return runLTXDirectorNode(node.id, runOpts);
     if(node.type === 'llm') return runLLMNode(node.id, runOpts);
@@ -12914,7 +13421,7 @@ async function runLimitedCascadeRounds(rounds, limit, runner){
     return Promise.allSettled(workers);
 }
 function canvasRunTypes(){
-    return ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh','minimax'];
+    return ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh','minimax','tripo'];
 }
 function canvasWorkflowEdges(){
     const runTypes = canvasRunTypes();
@@ -13155,6 +13662,7 @@ async function runOneCascadePass(order, options={}){
             if(node.type === 'generator') await runGenerator(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'midjourney') await runMidjourneyNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'msgen') await runMsGenNode(id, {cascade:true, cascadeTargetId:targetId});
+            else if(node.type === 'tripo') await runTripoNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'comfy') await runComfyNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'ltxDirector') await runLTXDirectorNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'llm') await runLLMNode(id, {cascade:true, cascadeTargetId:targetId});
@@ -13339,6 +13847,7 @@ function runTaskLabel(run){
     if(run?.nodeType === 'generator') return node.model || 'API Image';
     if(run?.nodeType === 'video') return node.model || 'Video';
     if(run?.nodeType === 'msgen') return node.msCustomModel || node.msgenModel || 'Modelscope';
+    if(run?.nodeType === 'tripo') return node.tripoModelVersion || 'Tripo 3D';
     return run?.nodeType || 'Generate';
 }
 function requestMetaFromResult(result={}){
@@ -13356,6 +13865,7 @@ function runPlatformLabel(run){
     const node = run?.node || {};
     if(run?.nodeType === 'generator') return providerById(node.apiProvider || 'comfly')?.name || node.apiProvider || 'API';
     if(run?.nodeType === 'msgen') return 'Modelscope';
+    if(run?.nodeType === 'tripo') return 'Tripo 3D';
     if(run?.nodeType === 'video') return providerById(node.apiProvider || 'comfly')?.name || node.apiProvider || 'Video';
     if(run?.nodeType === 'comfy') return 'ComfyUI';
     if(run?.nodeType === 'ltxDirector') return 'ComfyUI';
@@ -14756,14 +15266,31 @@ function connectSelectionToGenerator(kind, genId){
     syncGeneratorInputs();
 }
 
+function snapshotCanvasState(){
+    return {nodes:JSON.parse(JSON.stringify(serializableCanvasNodes())), connections:JSON.parse(JSON.stringify(connections))};
+}
 function pushUndo(){
     if(!canvas) return;
-    undoStack.push({nodes:JSON.parse(JSON.stringify(serializableCanvasNodes())), connections:JSON.parse(JSON.stringify(connections))});
+    undoStack.push(snapshotCanvasState());
     if(undoStack.length > UNDO_MAX) undoStack.shift();
+    redoStack.length = 0;
 }
 function performUndo(){
     if(!canvas || !undoStack.length) return;
     const state = undoStack.pop();
+    redoStack.push(snapshotCanvasState());
+    if(redoStack.length > UNDO_MAX) redoStack.shift();
+    nodes = state.nodes;
+    connections = state.connections;
+    selected.clear();
+    render();
+    scheduleSave();
+}
+function performRedo(){
+    if(!canvas || !redoStack.length) return;
+    const state = redoStack.pop();
+    undoStack.push(snapshotCanvasState());
+    if(undoStack.length > UNDO_MAX) undoStack.shift();
     nodes = state.nodes;
     connections = state.connections;
     selected.clear();
@@ -14830,6 +15357,8 @@ function copySelectedNodes(){
         nodes:JSON.parse(JSON.stringify(serializableCanvasNodes(toCopy))),
         connections:JSON.parse(JSON.stringify(pickedConnections))
     };
+    const imageNode = toCopy.find(n => n.type === 'image' && n.url);
+    if(imageNode) writeImageToSystemClipboard(imageNode.url);
 }
 function clipboardNodeCount(){
     if(Array.isArray(clipboard)) return clipboard.length;
@@ -15195,7 +15724,8 @@ function onNodeResize(e){
 function startLink(e, originId, originKind){
     e.stopPropagation();
     originKind = originKind || 'out';
-    const src = portPoint(originId, originKind);
+    // 拖线起点取按下瞬间的鼠标位置（即吸附后的圆点位置），连上后永久线仍锚在节点边缘中点
+    const src = screenToWorld(e.clientX, e.clientY);
     const source = nodes.find(n => n.id === originId);
     tempLink = {from:originId, originKind, x1:src.x, y1:src.y, x2:src.x, y2:src.y};
     window.onmousemove = e2 => {
@@ -15526,14 +16056,9 @@ function updateGroupMembership(movedNodes){
 function portPoint(id, kind){
     const n = nodes.find(x => x.id === id);
     if(!n) return {x:0,y:0};  // 真正的孤儿连线（节点已删除）：renderLinks 会跳过它
+    // 连线锚点固定取节点边缘中点（几何计算），不读端口 DOM——端口 DOM 会在边缘热区内吸附鼠标，
+    // 如果按端口位置画线，已连好的线会跟着鼠标跳舞。
     const el = nodesEl.querySelector(`.node[data-id="${CSS.escape(id)}"]`);
-    const port = el?.querySelector(`.port.${kind}`);
-    if(port){
-        const r = port.getBoundingClientRect();
-        return screenToWorld(r.left + r.width / 2, r.top + r.height / 2);
-    }
-    // 没有 DOM（节点渲染失败被跳过）或没找到端口时，用节点存储的几何坐标兜底，
-    // 让连线仍画在节点附近，而不是落到 (0,0) 或干脆消失。
     const w = (el?.offsetWidth) || n.w || 260, h = (el?.offsetHeight) || n.h || 160;
     const nx = Number(n.x) || 0, ny = Number(n.y) || 0;
     return kind === 'out' ? {x:nx + w, y:ny + h / 2} : {x:nx, y:ny + h / 2};
@@ -15856,7 +16381,9 @@ board.onmousedown = e => {
         startSelection(e);
         return;
     }
-    startBoardPan(e, {clearSelectionOnClick:true});
+    // 空白区域普通左键拖动直接框选；中键继续用于画布平移
+    e.preventDefault();
+    startSelection(e);
 };
 board.addEventListener('mousemove', e => {
     const point = screenToWorld(e.clientX, e.clientY);
@@ -16011,6 +16538,11 @@ window.addEventListener('keydown', e => {
             }, 90);
         }
     }
+    if((e.ctrlKey || e.metaKey) && ((e.shiftKey && key === 'z') || key === 'y')) {
+        const tag = document.activeElement?.tagName;
+        if(tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
+        e.preventDefault(); performRedo(); return;
+    }
     if((e.ctrlKey || e.metaKey) && key === 'z') {
         const tag = document.activeElement?.tagName;
         if(tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
@@ -16091,6 +16623,7 @@ window.onload = async () => {
     initOutputPreviewZoomEvents();
     applyViewport();
     await loadConfig();
+    if(window.TripoUI) TripoUI.mountBalance(document.getElementById('tripoBalance'));
     pruneMissingComfyWorkflows();
     // 编辑器页只负责打开单个画布：必须带 ?id；没有 id 就回到独立的选画布页面。
     const openId = new URLSearchParams(window.location.search).get('id');

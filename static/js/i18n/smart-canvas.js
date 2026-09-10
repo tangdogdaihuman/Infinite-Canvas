@@ -218,6 +218,8 @@
         "smart.mentionEmpty": { zh: "没有可引用的图片", en: "No images available" },
         "smart.toastNoUndo": { zh: "没有可撤销的操作", en: "Nothing to undo" },
         "smart.toastUndone": { zh: "已撤销", en: "Undone" },
+        "smart.toastNoRedo": { zh: "没有可重做的操作", en: "Nothing to redo" },
+        "smart.toastRedone": { zh: "已重做", en: "Redone" },
         "smart.toastNeedPrompt": { zh: "请输入提示词", en: "Please enter a prompt" },
         "smart.toastNeedGroup": { zh: "请先按住 Ctrl 框选至少两个图片节点", en: "Ctrl+box-select at least two image nodes first" },
         "smart.toastUploadFail": { zh: "素材上传失败", en: "Media upload failed" },

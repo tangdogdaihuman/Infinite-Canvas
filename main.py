@@ -314,7 +314,7 @@ JIMENG_LOGIN_SESSION = {
 }
 
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
-SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex"}
+SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex", "tripo"}
 SUPPORTED_IMAGE_REQUEST_MODES = {"openai", "openai-json", "openai-video-proxy", "openai-responses", "tudou-async"}
 RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.ai"
 RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.ai/openapi/v2"
@@ -709,6 +709,8 @@ def provider_key_env(provider_id):
         return "RUNNINGHUB_API_KEY"
     if provider_id == "volcengine":
         return "ARK_API_KEY"
+    if provider_id == "tripo":
+        return "TRIPO_API_KEY"
     return f"API_PROVIDER_{re.sub(r'[^A-Za-z0-9]', '_', provider_id).upper()}_KEY"
 
 def runninghub_wallet_key_env():
@@ -1557,6 +1559,16 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(WORKFLOW_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
 os.makedirs(CANVAS_DIR, exist_ok=True)
+
+@app.middleware("http")
+async def html_no_cache_middleware(request, call_next):
+    """HTML 页面禁用启发式缓存：改为每次重新校验（starlette 仍支持 304 协商），
+    避免前端发版后浏览器长期持有旧 HTML。"""
+    response = await call_next(request)
+    path = request.url.path
+    if path.endswith(".html") or path in ("/", ""):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
@@ -3923,10 +3935,10 @@ def resolve_chat_provider(provider: str, model: str, ms_model: str):
     mdl = selected_model(model, default_model)
     protocol = effective_protocol(api_provider, mdl)
     if protocol == "gemini":
-        # APIMart's native Gemini API is served from its official API domain.
-        # Keep the configured base URL for its OpenAI-compatible models only.
+        # APIMart 原生 Gemini API 跟随平台配置的域名（国内端点自动切到 api.apib.ai）；
+        # OpenAI 兼容模型仍走配置的 base_url。
         if is_apimart_provider(api_provider):
-            base_root = "https://api.apimart.ai"
+            base_root = apimart_native_api_root(api_provider)
         base = base_root if base_root.endswith("/v1beta") else base_root + "/v1beta"
     elif protocol == "volcengine":
         base = base_root if base_root.endswith("/api/v3") else base_root + "/api/v3"
@@ -4733,6 +4745,24 @@ def effective_protocol(provider, model=""):
 def is_apimart_provider(provider):
     base_url = str((provider or {}).get("base_url") or "").lower()
     return provider_protocol(provider) == "apimart" or "apimart.ai" in base_url
+
+def apimart_native_api_root(provider):
+    """APIMart 原生 Gemini API（/v1beta）的根地址，跟随平台配置的 base_url。
+    官方站是 api.apimart.ai；国内端点对应 api 子域 api.apib.ai
+    （实测 apib.ai 裸域只代理 /v1，/v1beta 返回 404 网站页；api.apib.ai 两个命名空间都有）。
+    其他自定义地址原样使用。"""
+    root = str((provider or {}).get("base_url") or "").strip().rstrip("/")
+    if not root:
+        return "https://api.apimart.ai"
+    for suffix in ("/v1beta", "/v1", "/v2"):
+        if root.lower().endswith(suffix):
+            root = root[: -len(suffix)]
+            break
+    scheme, _, rest = root.partition("://")
+    host = rest.split("/", 1)[0].lower()
+    if host in {"apib.ai", "www.apib.ai"}:
+        return f"{scheme}://api.apib.ai"
+    return root
 
 def detect_image_request_mode(base_url="", models=None):
     base = str(base_url or "").strip().lower()
@@ -8849,9 +8879,12 @@ def apimart_veo31_resolution(resolution: str) -> str:
     value = aliases.get(value, value)
     return value if value in {"720p", "1080p", "4k"} else "720p"
 
+# apib.ai 网关 nginx 的 body 上限实测约 1MB，比 APIMart 文档的 10MB 更紧，上传统一压到 900KB 以内
+APIMART_UPLOAD_MAX_BYTES = 900_000
+
 def apimart_upload_file_payload(path: str):
-    """Return (filename, bytes, content_type), keeping APIMart VEO images under the documented 10MB limit."""
-    max_bytes = 9_500_000
+    """Return (filename, bytes, content_type)，压缩到 apib.ai 网关可接受的大小（约 1MB 以内）。"""
+    max_bytes = APIMART_UPLOAD_MAX_BYTES
     size = os.path.getsize(path)
     if size <= max_bytes:
         with open(path, "rb") as fh:
@@ -8860,16 +8893,18 @@ def apimart_upload_file_payload(path: str):
         img = img.convert("RGBA")
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[-1])
-        quality = 92
-        while quality >= 62:
+        if max(bg.size) > 2048:
+            bg.thumbnail((2048, 2048), Image.LANCZOS)
+        quality = 88
+        while quality >= 42:
             buf = BytesIO()
             bg.save(buf, format="JPEG", quality=quality, optimize=True)
             data = buf.getvalue()
             if len(data) <= max_bytes:
                 name = os.path.splitext(os.path.basename(path))[0] + ".jpg"
                 return name, data, "image/jpeg"
-            quality -= 8
-    raise ValueError("图片超过 10MB，且压缩后仍无法满足 VEO3.1 图片限制")
+            quality -= 10
+    raise ValueError("图片过大，压缩后仍超出 APIMart 上传限制（约 1MB）")
 
 def invalid_video_image_preview(value: str) -> str:
     text = str(value or "")
@@ -8903,8 +8938,8 @@ def extract_apimart_asset_url(payload):
     return ""
 
 def apimart_upload_payload_from_bytes(data: bytes, mime: str, name_hint: str = "image"):
-    """把内存中的图片字节按 APIMart 的 10MB 限制压缩为可上传 payload。"""
-    max_bytes = 9_500_000
+    """把内存中的图片字节压缩为可上传 payload（适配 apib.ai 网关约 1MB 的 body 上限）。"""
+    max_bytes = APIMART_UPLOAD_MAX_BYTES
     ext = mimetypes.guess_extension(mime or "image/png") or ".png"
     if len(data) <= max_bytes and (mime or "").lower() in ("image/png", "image/jpeg", "image/webp"):
         return f"{name_hint}{ext}", data, (mime or "image/png")
@@ -8917,15 +8952,17 @@ def apimart_upload_payload_from_bytes(data: bytes, mime: str, name_hint: str = "
             target = bg
         else:
             target = img.convert("RGB")
-        quality = 92
-        while quality >= 62:
+        if max(target.size) > 2048:
+            target.thumbnail((2048, 2048), Image.LANCZOS)
+        quality = 88
+        while quality >= 42:
             buf = BytesIO()
             target.save(buf, format="JPEG", quality=quality, optimize=True)
             payload = buf.getvalue()
             if len(payload) <= max_bytes:
                 return f"{name_hint}.jpg", payload, "image/jpeg"
-            quality -= 8
-    raise ValueError("data URL 图片超过 10MB，且压缩后仍无法满足 APIMart 限制")
+            quality -= 10
+    raise ValueError("data URL 图片过大，压缩后仍超出 APIMart 上传限制（约 1MB）")
 
 def apimart_upload_raw_file_payload(path: str):
     with open(path, "rb") as fh:
@@ -9909,7 +9946,7 @@ def gemini_model_name(model):
 def gemini_endpoint_url(provider, model):
     model_name = urllib.parse.quote(gemini_model_name(model), safe="")
     if is_apimart_provider(provider) and not str((provider or {}).get("image_generation_endpoint") or "").strip():
-        return f"https://api.apimart.ai/v1beta/models/{model_name}:generateContent"
+        return f"{apimart_native_api_root(provider)}/v1beta/models/{model_name}:generateContent"
     return provider_endpoint_url(provider, "image_generation_endpoint", f"/v1beta/models/{model_name}:generateContent")
 
 def gemini_image_config(size):
@@ -9924,8 +9961,8 @@ def gemini_image_config(size):
     aspect_ratio, resolution = apimart_size_resolution(size)
     return {"aspectRatio": aspect_ratio, "imageSize": resolution.upper()}
 
-def gemini_reference_part(ref):
-    value = reference_to_data_url(ref, max_size=1536)
+def gemini_reference_part(ref, max_size=1536):
+    value = reference_to_data_url(ref, max_size=max_size)
     if not value:
         return None
     if isinstance(value, str) and value.startswith("data:image/") and ";base64," in value:
@@ -9939,19 +9976,32 @@ def gemini_reference_part(ref):
 async def generate_gemini_provider_image(prompt, size, model, reference_images=None, provider=None):
     model_name = gemini_model_name(model)
     endpoint = gemini_endpoint_url(provider, model_name)
-    parts = [{"text": prompt.strip()}]
-    for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
-        part = gemini_reference_part(ref)
-        if part:
-            parts.append(part)
-    body = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {
-            "responseModalities": ["TEXT", "IMAGE"],
-            "imageConfig": gemini_image_config(size),
-        },
-    }
+    refs = (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]
+    # apib.ai 网关 body 上限约 1MB，base64 内联参考图容易 413；
+    # APIMart 系平台先上传换公网 URL 用 fileData 引用，失败再退回 1024px 压缩内联。
+    upload_first = is_apimart_provider(provider) and bool(refs)
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=1800.0, write=120.0, pool=20.0)) as client:
+        parts = [{"text": prompt.strip()}]
+        for ref in refs:
+            part = None
+            if upload_first:
+                uploaded = await upload_image_for_apimart(client, provider, (ref or {}).get("url"))
+                if valid_apimart_video_image_input(uploaded):
+                    mime = "image/jpeg" if uploaded.split("?", 1)[0].lower().endswith((".jpg", ".jpeg")) else "image/png"
+                    part = {"fileData": {"mimeType": mime, "fileUri": uploaded}}
+                else:
+                    part = gemini_reference_part(ref, max_size=1024)
+            else:
+                part = gemini_reference_part(ref)
+            if part:
+                parts.append(part)
+        body = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"],
+                "imageConfig": gemini_image_config(size),
+            },
+        }
         response = await client.post(endpoint, headers=api_headers(provider=provider), json=body)
         response.raise_for_status()
         # APIMart wraps the native Gemini body in {code, data}; unwrap it before
@@ -11313,7 +11363,17 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 "official_fallback": False,
             }
             if image_refs:
-                body["image_urls"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]]
+                # apib.ai（国内端点）网关对 JSON body 限制很小（实测约 1MB），
+                # base64 内联参考图很容易 413；先上传到 APIMart 换公网 URL，
+                # 上传失败再退回 1024px 压缩 data URL（单图 base64 约几百 KB）。
+                image_urls = []
+                for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]:
+                    uploaded = await upload_image_for_apimart(client, provider, ref.get("url"))
+                    if valid_apimart_video_image_input(uploaded):
+                        image_urls.append(uploaded)
+                    else:
+                        image_urls.append(reference_to_data_url(ref, max_size=1024))
+                body["image_urls"] = image_urls
             response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
         elif is_gpt2 and not image_refs and not mask_refs:
             body = {"model": model, "prompt": prompt, "size": size}
@@ -13092,6 +13152,229 @@ async def jimeng_credit():
     raw = await run_jimeng_cli(["user_credit"], timeout=30)
     return {"success": True, "raw": raw}
 
+# --- Tripo 3D ---
+# Tripo API V3（V2 于 2026-11-01 下线）。国内站与国际站 Key 不通用，base_url 区域必须与 Key 匹配。
+TRIPO_BASE_URL = "https://openapi.tripo3d.com/v3"
+TRIPO_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "tripo")
+os.makedirs(TRIPO_OUTPUT_DIR, exist_ok=True)
+TRIPO_TASK_TYPES = {"text_to_model", "image_to_model", "multiview_to_model", "texture_model", "convert_model", "refine_model"}
+# V3 按能力拆分独立端点，不再使用 POST /task + type 字段
+TRIPO_TASK_ENDPOINTS = {
+    "text_to_model": "/generation/text-to-model",
+    "image_to_model": "/generation/image-to-model",
+    "multiview_to_model": "/generation/multiview-to-model",
+    "texture_model": "/models/texture",
+    "convert_model": "/models/convert",
+    "refine_model": "/models/refine",
+}
+# V3 生成类任务必须显式传 model_version；V2 旧版本号统一回落到 v2.5（V2 时代的默认行为）
+TRIPO_GENERATION_TASK_TYPES = {"text_to_model", "image_to_model", "multiview_to_model"}
+TRIPO_DEFAULT_MODEL_VERSION = "v2.5-20250123"
+TRIPO_LEGACY_MODEL_VERSIONS = {
+    "", "default", "v1.3-20240522", "v1.4-20240625", "v2.0-20240919",
+    "turbo-v1.0-20250506", "v2.5-20260210",
+}
+TRIPO_LEGACY_BASE_URLS = {
+    "https://api.tripo3d.com/v2/openapi": "https://openapi.tripo3d.com/v3",
+    "https://api.tripo3d.ai/v2/openapi": "https://openapi.tripo3d.ai/v3",
+}
+
+def normalize_tripo_base_url(url):
+    """旧 V2 地址自动映射到同区域 V3 端点（国内 .com / 国际 .ai 互不通用）。"""
+    root = str(url or "").strip().rstrip("/")
+    return TRIPO_LEGACY_BASE_URLS.get(root.lower(), root)
+
+def tripo_base_url():
+    """优先使用 API 设置里 Tripo 平台的 base_url（支持国内/国际站切换）。"""
+    try:
+        for p in load_api_providers():
+            if p.get("id") == "tripo" and str(p.get("base_url") or "").strip():
+                return normalize_tripo_base_url(p["base_url"])
+    except Exception:
+        pass
+    return TRIPO_BASE_URL
+
+def tripo_api_key():
+    return (os.environ.get("TRIPO_API_KEY") or "").strip()
+
+def tripo_headers():
+    key = tripo_api_key()
+    if not key:
+        raise HTTPException(status_code=400, detail="未配置 Tripo API Key，请在 API 设置中为 Tripo 3D 平台填写密钥")
+    return {"Authorization": f"Bearer {key}"}
+
+def tripo_error_detail(resp):
+    try:
+        data = resp.json()
+        return data.get("message") or data.get("error") or str(data)[:300]
+    except Exception:
+        return (resp.text or "")[:300]
+
+@app.get("/api/tripo/balance")
+async def tripo_balance():
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{tripo_base_url()}/account/balance", headers=tripo_headers())
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"Tripo 余额查询失败：{tripo_error_detail(resp)}")
+    data = resp.json()
+    if data.get("code") not in (0, None):
+        raise HTTPException(status_code=400, detail=f"Tripo 余额查询失败：{data.get('message') or data}")
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    payload = payload or {}
+    return {"success": True, "balance": payload.get("balance"), "frozen": payload.get("frozen"), "raw": payload}
+
+@app.post("/api/tripo/upload")
+async def tripo_upload(payload: dict):
+    name = (payload.get("name") or "image.png").strip() or "image.png"
+    data_b64 = payload.get("data_base64") or ""
+    if data_b64.startswith("data:") and "," in data_b64:
+        data_b64 = data_b64.split(",", 1)[1]
+    try:
+        raw = base64.b64decode(data_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="图片数据解码失败")
+    if not raw:
+        raise HTTPException(status_code=400, detail="图片数据为空")
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(f"{tripo_base_url()}/files", headers=tripo_headers(), files={"file": (name, raw)})
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"Tripo 图片上传失败：{tripo_error_detail(resp)}")
+    data = resp.json()
+    if data.get("code") != 0:
+        raise HTTPException(status_code=400, detail=f"Tripo 图片上传失败：{data.get('message') or data}")
+    token = (data.get("data") or {}).get("file_token") or (data.get("data") or {}).get("image_token")
+    if not token:
+        raise HTTPException(status_code=400, detail=f"Tripo 上传未返回 file_token：{data}")
+    return {"success": True, "file_token": token}
+
+@app.post("/api/tripo/task")
+async def tripo_create_task(payload: dict):
+    task_type = (payload.get("task_type") or "").strip()
+    if task_type not in TRIPO_TASK_TYPES:
+        raise HTTPException(status_code=400, detail=f"不支持的 Tripo 任务类型：{task_type}")
+    body = {}
+    model_version = (payload.get("model_version") or "").strip()
+    if task_type in TRIPO_GENERATION_TASK_TYPES:
+        if model_version.lower() in TRIPO_LEGACY_MODEL_VERSIONS:
+            model_version = ""
+        body["model_version"] = model_version or TRIPO_DEFAULT_MODEL_VERSION
+    elif model_version:
+        body["model_version"] = model_version
+    file_tokens = payload.get("file_tokens") or []
+    file_types = payload.get("file_types") or []
+    if task_type == "image_to_model":
+        if not file_tokens:
+            raise HTTPException(status_code=400, detail="缺少输入图片")
+        body["file"] = {"type": (file_types[0] if file_types else "png"), "file_token": file_tokens[0]}
+    elif task_type == "multiview_to_model":
+        if len(file_tokens) < 4:
+            raise HTTPException(status_code=400, detail="四视图模式需要 4 张图片（前/后/左/右）")
+        body["files"] = [
+            {"type": (file_types[i] if i < len(file_types) else "png"), "file_token": token}
+            for i, token in enumerate(file_tokens[:4])
+        ]
+        body["ortho_projection"] = bool(payload.get("ortho_projection", True))
+    elif task_type == "text_to_model":
+        prompt = (payload.get("prompt") or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="缺少提示词")
+        body["prompt"] = prompt
+        negative = (payload.get("negative_prompt") or "").strip()
+        if negative:
+            body["negative_prompt"] = negative
+    elif task_type in ("texture_model", "convert_model", "refine_model"):
+        original = (payload.get("original_task_id") or "").strip()
+        if not original:
+            raise HTTPException(status_code=400, detail="缺少原始任务 ID")
+        if task_type == "refine_model":
+            body["draft_model_task_id"] = original
+        else:
+            body["original_model_task_id"] = original
+        if task_type == "convert_model":
+            body["format"] = (payload.get("format") or "GLB").strip().upper()
+    for key in ("texture", "pbr", "quad", "auto_size"):
+        if payload.get(key) is not None:
+            body[key] = bool(payload.get(key))
+    for key in ("texture_quality", "texture_alignment", "orientation", "style"):
+        val = payload.get(key)
+        if isinstance(val, str):
+            val = val.strip()
+        if val:
+            body[key] = val
+    for key in ("face_limit", "texture_seed"):
+        if payload.get(key) not in (None, ""):
+            try:
+                body[key] = int(payload.get(key))
+            except (TypeError, ValueError):
+                pass
+    # P1 模型不接受这些几何参数（即使传 false/null 也会被上游拒绝）
+    if str(body.get("model_version") or "").upper().startswith("P1"):
+        for key in ("quad", "smart_low_poly", "generate_parts", "geometry_quality"):
+            body.pop(key, None)
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            f"{tripo_base_url()}{TRIPO_TASK_ENDPOINTS[task_type]}",
+            headers={**tripo_headers(), "Content-Type": "application/json"},
+            json=body,
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"Tripo 任务创建失败：{tripo_error_detail(resp)}")
+    data = resp.json()
+    if data.get("code") != 0:
+        raise HTTPException(status_code=400, detail=f"Tripo 任务创建失败：{data.get('message') or data}")
+    task_id = (data.get("data") or {}).get("task_id")
+    if not task_id:
+        raise HTTPException(status_code=400, detail=f"Tripo 未返回 task_id：{data}")
+    return {"success": True, "task_id": task_id, "request": body}
+
+@app.get("/api/tripo/task/{task_id}")
+async def tripo_query_task(task_id: str):
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{tripo_base_url()}/tasks/{task_id}", headers=tripo_headers())
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"Tripo 任务查询失败：{tripo_error_detail(resp)}")
+    data = resp.json()
+    if data.get("code") != 0:
+        raise HTTPException(status_code=400, detail=f"Tripo 任务查询失败：{data.get('message') or data}")
+    task = data.get("data") or {}
+    # V3 输出字段名归一化为画布前端读取的键名（model/pbr_model/rendered_image）
+    output = task.get("output")
+    if isinstance(output, dict):
+        model_url = output.get("model_url")
+        if model_url:
+            output.setdefault("model", model_url)
+            output.setdefault("pbr_model", model_url)
+            output.setdefault("base_model", model_url)
+        if output.get("rendered_image_url"):
+            output.setdefault("rendered_image", output["rendered_image_url"])
+        if output.get("generated_image_url"):
+            output.setdefault("generated_image", output["generated_image_url"])
+    if task.get("error_message") and not task.get("error"):
+        task["error"] = task["error_message"]
+    return {"success": True, "task": task}
+
+@app.post("/api/tripo/download")
+async def tripo_download(payload: dict):
+    url = (payload.get("url") or "").strip()
+    if not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="无效的下载地址")
+    kind = re.sub(r"[^a-zA-Z0-9_-]", "", (payload.get("kind") or "model"))[:20] or "model"
+    name_hint = re.sub(r"[^a-zA-Z0-9_-]", "", (payload.get("name") or ""))[:40]
+    ext = ".glb"
+    path_part = url.split("?", 1)[0]
+    tail = path_part.rsplit("/", 1)[-1]
+    if "." in tail:
+        ext = "." + tail.rsplit(".", 1)[-1].lower()[:8]
+    fname = f"tripo_{int(time.time())}_{kind}{('_' + name_hint) if name_hint else ''}{ext}"
+    fpath = os.path.join(TRIPO_OUTPUT_DIR, fname)
+    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+        resp = await client.get(url)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="Tripo 文件下载失败")
+    with open(fpath, "wb") as fh:
+        fh.write(resp.content)
+    return {"success": True, "url": f"/output/tripo/{fname}", "name": fname, "size": len(resp.content)}
+
 @app.post("/api/jimeng/logout")
 async def jimeng_logout():
     raw = await run_jimeng_cli(["logout"], timeout=30)
@@ -13585,6 +13868,24 @@ async def test_provider_connection(payload: TestConnectionPayload):
             "protocol": "runninghub",
             "raw": payload_models.get("raw"),
         }
+    if protocol == "tripo":
+        # Tripo 没有 /models 列表接口，用 V3 余额接口验证地址与 Key
+        tripo_url = normalize_tripo_base_url(payload.base_url or "") or TRIPO_BASE_URL
+        tripo_key = api_key_from_payload(payload, protocol)
+        if not tripo_key:
+            raise HTTPException(status_code=400, detail="请先填写或保存 API Key")
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(f"{tripo_url}/account/balance", headers={"Authorization": bearer_auth_value(tripo_key), "Accept": "application/json"})
+            if resp.status_code == 200:
+                data = resp.json() if resp.text else {}
+                balance_data = data.get("data") if isinstance(data.get("data"), dict) else data
+                balance = (balance_data or {}).get("balance")
+                message = f"Tripo V3 OpenAPI 可用，余额 {balance}" if balance is not None else "Tripo V3 OpenAPI 可用"
+                return {"ok": True, "status": 200, "message": message, "model_count": 0, "image_models": [], "chat_models": [], "video_models": [], "all": [], "protocol": "tripo"}
+            return {"ok": False, "status": resp.status_code, "message": resp.text[:300]}
+        except httpx.HTTPError as e:
+            return {"ok": False, "status": 0, "message": str(e)[:300]}
     base_url = (payload.base_url or "").strip().rstrip("/")
     if not base_url:
         raise HTTPException(status_code=400, detail="请先填写请求地址")
@@ -19031,8 +19332,11 @@ def run_workflow(name: str, payload: WorkflowRunRequest):
 
 if __name__ == "__main__":
     import uvicorn
+    # 默认用冷门端口 38080，避开 3000/5000/8000/8080 等开发热门端口；
+    # 可用环境变量 APP_PORT 覆盖（run.bat / mac 启动脚本会同步这个变量）。
+    port = int(os.getenv("APP_PORT") or "38080")
     # 关闭服务端协议级 WebSocket ping：部分客户端（如 PS UXP 面板）不会自动回 pong，
     # 默认 20s ping/20s 超时会把这些连接每隔一会儿就踢掉造成"频繁断连"。
     # 客户端有自己的应用层心跳 + 断线重连兜底，这里禁用协议 ping 更稳。
-    uvicorn.run(app, host="0.0.0.0", port=3000,
+    uvicorn.run(app, host="0.0.0.0", port=port,
                 ws_ping_interval=None, ws_ping_timeout=None)

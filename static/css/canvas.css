@@ -769,11 +769,14 @@ input[type=range].canvas-range::-webkit-slider-runnable-track { height:3px; bord
 .output-recover-query:hover:not(:disabled) { background:var(--soft-2); }
 .output-recover-query:disabled { opacity:.55; cursor:default; }
 @keyframes spin { to { transform:rotate(360deg); } }
-.port { position:absolute; top:50%; width:44px; height:44px; border-radius:50%; cursor:crosshair; transform:translateY(-50%); z-index:3; }
-.port::after { content:""; position:absolute; left:15px; top:15px; width:14px; height:14px; border-radius:50%; border:2px solid #fff; background:#111827; box-shadow:0 0 0 1px #94a3b8; transition:transform .14s var(--ease); }
-.port:hover::after { transform:scale(1.25); }
-.port.in { left:-29px; cursor:crosshair; }
-.port.out { right:-15px; }
+/* 连接端口：固定在边缘中点的大热区（44px 向外 + 20px 向内 × 80% 高），鼠标进入时圆点（::after）二维吸附到鼠标位置（--dot-x/--dot-y 由 JS 设置） */
+.port { position:absolute; top:50%; width:64px; height:min(80%, 420px); min-height:44px; cursor:crosshair; transform:translateY(-50%); z-index:3; }
+.port::after { content:""; position:absolute; left:var(--dot-x, 20px); top:var(--dot-y, 50%); width:14px; height:14px; border-radius:50%; border:2px solid #fff; background:#111827; box-shadow:0 0 0 1px #94a3b8; transform:translate(-50%, -50%); transition:left .09s ease-out, top .09s ease-out, transform .14s var(--ease); }
+.port::before { content:"+"; position:absolute; left:var(--dot-x, 20px); top:var(--dot-y, 50%); width:14px; height:14px; transform:translate(-50%, -50%); color:#fff; font-size:11px; font-weight:700; line-height:14px; text-align:center; opacity:0; transition:left .09s ease-out, top .09s ease-out, opacity .14s ease; z-index:1; pointer-events:none; }
+.port:hover::before { opacity:1; }
+.port:hover::after { transform:translate(-50%, -50%) scale(1.25); }
+.port.in { left:-44px; }
+.port.out { right:-44px; }
 .node > .port { top:50%; }
 .ltxDirector-node > .port,
 .ltx-director-node > .port { top:50%; }
@@ -1566,3 +1569,36 @@ html[data-studio-scale="off"].studio-scale-managed .toolbar.scale-expanded .tool
         margin-left:0;
     }
 }
+
+/* —— Tripo 3D 节点 —— */
+.tripo-body .ms-content{ padding-top:2px; }
+.tripo-view-slots{ display:grid; grid-template-columns:repeat(4, 1fr); gap:6px; margin-top:6px; }
+.tripo-view-slots.single{ grid-template-columns:1fr; }
+.tripo-slot{ position:relative; aspect-ratio:1; border:1.5px dashed rgba(148,163,184,.45); border-radius:10px; overflow:hidden; background:rgba(148,163,184,.06); }
+.tripo-slot.filled{ border-style:solid; border-color:rgba(148,163,184,.3); }
+.tripo-slot img{ width:100%; height:100%; object-fit:cover; display:block; }
+.tripo-slot-upload{ width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; background:transparent; border:none; cursor:pointer; color:var(--faint,#94a3b8); font-size:10px; font-weight:700; }
+.tripo-slot-upload:hover{ color:var(--accent,#6366f1); background:rgba(99,102,241,.06); }
+.tripo-slot-tag{ position:absolute; left:4px; bottom:4px; font-size:9px; font-weight:700; color:#fff; background:rgba(15,23,42,.65); padding:1px 6px; border-radius:6px; pointer-events:none; }
+.tripo-slot-clear{ position:absolute; top:3px; right:3px; width:18px; height:18px; border-radius:50%; border:none; background:rgba(15,23,42,.7); color:#fff; font-size:12px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+.tripo-slot-clear:hover{ background:#ef4444; }
+.tripo-checks{ flex-wrap:wrap; gap:4px 12px; }
+.tripo-checks .setting-check{ display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:700; cursor:pointer; }
+.tripo-prompt-input{ width:100%; resize:vertical; font-size:12px; }
+.tripo-progress{ margin-top:8px; }
+.tripo-progress-track{ height:6px; border-radius:99px; background:rgba(148,163,184,.18); overflow:hidden; }
+.tripo-progress-fill{ height:100%; border-radius:99px; background:linear-gradient(90deg,#6366f1,#8b5cf6); transition:width .4s ease; }
+.tripo-progress-label{ margin-top:4px; font-size:10px; font-weight:700; color:var(--faint,#94a3b8); }
+.tripo-result{ margin-top:8px; }
+.tripo-viewer{ width:100%; height:230px; border-radius:12px; overflow:hidden; background:#15171c; position:relative; }
+.tripo-viewer canvas{ display:block; }
+.tripo-viewer-loading{ width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#64748b; }
+.tripo-viewer-fallback{ width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:11px; font-weight:700; }
+.tripo-result-actions{ display:flex; align-items:center; gap:6px; margin-top:6px; flex-wrap:wrap; }
+.tripo-result-actions .secondary-btn{ display:inline-flex; align-items:center; gap:4px; font-size:11px; padding:4px 10px; text-decoration:none; }
+.tripo-convert-group{ display:inline-flex; align-items:center; gap:4px; }
+.tripo-balance{ display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:800; color:var(--faint,#94a3b8); white-space:nowrap; }
+.tripo-balance:hover{ color:var(--accent,#6366f1); }
+.tripo-balance-error{ color:#f59e0b !important; }
+.tripo-spin{ animation:tripo-rotate 1s linear infinite; }
+@keyframes tripo-rotate{ from{ transform:rotate(0deg); } to{ transform:rotate(360deg); } }

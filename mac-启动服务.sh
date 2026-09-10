@@ -7,11 +7,13 @@ fi
 if [ -z "$LAN_IP" ]; then
   LAN_IP="127.0.0.1"
 fi
-APP_URL="http://${LAN_IP}:3000/"
+PORT="${APP_PORT:-38080}"
+export APP_PORT="$PORT"
+APP_URL="http://${LAN_IP}:${PORT}/"
 
 echo "Starting ComfyUI-API-Modelscope..."
 echo "Visit: ${APP_URL}"
-echo "Local: http://127.0.0.1:3000/"
+echo "Local: http://127.0.0.1:${PORT}/"
 echo "Press Ctrl+C to stop."
 echo ""
 

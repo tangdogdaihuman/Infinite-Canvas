@@ -93,7 +93,7 @@ const CODEX_DEFAULT_CHAT_MODELS = ['gpt-5.5'];
 const GEMINI_CLI_DEFAULT_IMAGE_MODELS = ['auto'];
 const GEMINI_CLI_DEFAULT_CHAT_MODELS = ['auto'];
 const CLI_PROTOCOLS = new Set(['jimeng', 'codex', 'gemini-cli']);
-const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli'];
+const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli', 'tripo'];
 const CLI_PROVIDER_PRESETS = {
     jimeng:{id:'jimeng', name:'即梦 CLI', protocol:'jimeng'},
     codex:{id:'codex', name:'GPT CLI', protocol:'codex'},

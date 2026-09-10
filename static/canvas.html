@@ -16,13 +16,16 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.01.1785292594"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.08.01.1785292594"></script>
-    <script src="/static/js/theme.js?v=2026.08.01.1785292593"></script>
-    <script src="/static/js/touch-mouse.js?v=2026.08.01.1785292587"></script>
-    <script src="/static/js/i18n.js?v=2026.08.01.1785292592"></script>
-    <link rel="stylesheet" href="/static/css/canvas.css?v=2026.08.04.minimax">
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.01.1785292588">
+    <script type="importmap">
+    {"imports":{"three":"/static/vendor/js/three-0.160.0.module.js"}}
+    </script>
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.04.1786152769"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.08.04.1786152769"></script>
+    <script src="/static/js/theme.js?v=2026.08.04.1786152769"></script>
+    <script src="/static/js/touch-mouse.js?v=2026.08.04.1786152769"></script>
+    <script src="/static/js/i18n.js?v=2026.08.04.1786152769"></script>
+    <link rel="stylesheet" href="/static/css/canvas.css?v=2026.08.04.1786451703">
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.04.1786152769">
 </head>
 <body>
     <div id="shell" class="shell no-canvas">
@@ -44,6 +47,7 @@
                     <button class="tool-btn" onclick="addLLMNode()"><i data-lucide="message-square-text" class="w-4 h-4"></i>LLM</button>
                     <button class="tool-btn" onclick="addGeneratorNode()"><i data-lucide="wand-sparkles" class="w-4 h-4"></i><span data-i18n="canvas.apiGenerate">API生成</span></button>
                     <button class="tool-btn" onclick="addMsGenNode()"><i data-lucide="cloud-lightning" class="w-4 h-4"></i><span data-i18n="canvas.msGenerate">MS生成</span></button>
+                    <button class="tool-btn" onclick="addTripoNode()"><i data-lucide="box" class="w-4 h-4"></i><span>Tripo 3D</span></button>
                     <button class="tool-btn" onclick="addVideoNode()"><i data-lucide="clapperboard" class="w-4 h-4"></i><span data-i18n="canvas.videoGenerate">视频生成</span></button>
                     <button class="tool-btn" onclick="addMiniMaxNode()"><i data-lucide="sparkles" class="w-4 h-4"></i><span>MiniMax</span></button>
                     <button class="tool-btn" onclick="addRhNode()"><i data-lucide="workflow" class="w-4 h-4"></i><span data-i18n="canvas.rhGenerate">RH生成</span></button>
@@ -53,6 +57,7 @@
                     <button class="tool-btn" onclick="groupSelectedImages()"><i data-lucide="group" class="w-4 h-4"></i><span data-i18n="canvas.group">分组</span></button>
                 </div>
                 <div class="toolbar-fixed">
+                    <button id="tripoBalance" class="tool-btn tripo-balance-host" type="button" title="Tripo 余额"></button>
                     <button id="workflowTransferToggle" class="tool-btn toolbar-workflow" type="button" title="导入导出工作流" aria-label="导入导出工作流"><i data-lucide="package-open" class="w-4 h-4"></i><span>工作流</span></button>
                     <button id="canvasAssetToggle" class="tool-btn toolbar-asset canvas-asset-toggle" type="button" title="资产库" aria-label="资产库"><i data-lucide="library" class="w-4 h-4"></i><span>资产库</span></button>
                     <button id="canvasLogToggle" class="tool-btn toolbar-log" type="button" onclick="openCanvasLog(event)" title="日志" aria-label="日志" data-i18n-title="canvas.logs"><i data-lucide="list-todo" class="w-4 h-4"></i><span data-i18n="canvas.logs">日志</span></button>
@@ -74,6 +79,7 @@
                 <button class="menu-btn" onclick="menuAdd('generator')"><i data-lucide="wand-sparkles" class="w-4 h-4"></i><span data-i18n="canvas.apiGenerate">API生成</span></button>
                 <button class="menu-btn" onclick="menuAdd('midjourney')"><i data-lucide="panel-top" class="w-4 h-4"></i><span>Midjourney</span></button>
                 <button class="menu-btn" onclick="menuAdd('msgen')"><i data-lucide="cloud-lightning" class="w-4 h-4"></i><span data-i18n="canvas.modelscopeGenerate">Modelscope生成</span></button>
+                <button class="menu-btn" onclick="menuAdd('tripo')"><i data-lucide="box" class="w-4 h-4"></i><span>Tripo 3D</span></button>
                 <button class="menu-btn" onclick="menuAdd('video')"><i data-lucide="clapperboard" class="w-4 h-4"></i><span data-i18n="canvas.videoGenerateNode">视频生成</span></button>
                 <button class="menu-btn" onclick="menuAdd('minimax')"><i data-lucide="sparkles" class="w-4 h-4"></i><span>MiniMax H3</span></button>
                 <button class="menu-btn" onclick="menuAdd('rh')"><i data-lucide="workflow" class="w-4 h-4"></i><span data-i18n="canvas.rhGenerate">RH生成</span></button>
@@ -353,7 +359,8 @@
         </div>
     </div>
 
-    <script src="/static/js/ltx-director-timeline.js?v=2026.08.01.1785292592"></script>
-    <script src="/static/js/canvas.js?v=2026.08.04.minimax"></script>
+    <script src="/static/js/ltx-director-timeline.js?v=2026.08.04.1786152769"></script>
+    <script src="/static/js/tripo-common.js?v=2026.08.04.1786351643"></script>
+    <script src="/static/js/canvas.js?v=2026.08.04.1786451670"></script>
 </body>
 </html>
