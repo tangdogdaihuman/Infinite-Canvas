@@ -67,6 +67,8 @@ for(const file of scanFiles){
         /\btr\(\s*["']([^"']+)["']\s*\)/g,
         /\btrf\(\s*["']([^"']+)["']/g,
         /\btf\(\s*["']([^"']+)["']/g,
+        /* tl()/tlf()：带中文兜底的封装（tr 缺 key 时会返回 key 本身，故画布侧新增了这层） */
+        /\btlf?\(\s*["']([^"']+)["']/g,
     ]){
         let match;
         while((match = re.exec(text))) used.add(match[1]);

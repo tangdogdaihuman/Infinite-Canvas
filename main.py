@@ -13167,9 +13167,9 @@ TRIPO_TASK_ENDPOINTS = {
     "convert_model": "/models/convert",
     "refine_model": "/models/refine",
 }
-# V3 生成类任务必须显式传 model_version；V2 旧版本号统一回落到 v2.5（V2 时代的默认行为）
+# V3 生成类任务必须显式传 model_version；V2 旧版本号统一回落到官方服务端默认（v3.1）
 TRIPO_GENERATION_TASK_TYPES = {"text_to_model", "image_to_model", "multiview_to_model"}
-TRIPO_DEFAULT_MODEL_VERSION = "v2.5-20250123"
+TRIPO_DEFAULT_MODEL_VERSION = "v3.1-20260211"
 TRIPO_LEGACY_MODEL_VERSIONS = {
     "", "default", "v1.3-20240522", "v1.4-20240625", "v2.0-20240919",
     "turbo-v1.0-20250506", "v2.5-20260210",
@@ -13178,6 +13178,46 @@ TRIPO_LEGACY_BASE_URLS = {
     "https://api.tripo3d.com/v2/openapi": "https://openapi.tripo3d.com/v3",
     "https://api.tripo3d.ai/v2/openapi": "https://openapi.tripo3d.ai/v3",
 }
+# 上游文档存在分歧，这里做一次「参数校验失败自动回退」（400 时才会重试，不会重复建任务、不会重复扣点）：
+# 1) 模型字段名：官方 JS/Go SDK 用 model，V3 文档回显用 model_version；
+# 2) geometry_quality 取值：官方 Changelog 写 detailed，阿里云最新文档写 ultra。
+TRIPO_MODEL_FIELD_ALIASES = ("model_version", "model")
+TRIPO_GEO_QUALITY_ALIASES = {"ultra": "detailed", "detailed": "ultra", "high": "ultra"}
+# models/texture 只接受这两个贴图版本（官方 SDK versions.rs）
+TRIPO_TEXTURE_MODEL_VERSIONS = {"v3.0-20250812", "v2.5-20250123"}
+TRIPO_TEXTURE_QUALITIES = {"standard", "detailed", "extreme"}
+TRIPO_BOOL_PARAMS = ("texture", "pbr", "quad", "auto_size", "smart_low_poly", "generate_parts", "autofix")
+TRIPO_STR_PARAMS = ("texture_quality", "texture_alignment", "orientation", "style", "geometry_quality")
+TRIPO_INT_PARAMS = ("face_limit", "texture_seed")
+
+
+async def tripo_submit_task(client, task_type, body):
+    """提交 Tripo 任务，对上游字段名/取值分歧做一次自动回退。"""
+    url = f"{tripo_base_url()}{TRIPO_TASK_ENDPOINTS[task_type]}"
+    headers = {**tripo_headers(), "Content-Type": "application/json"}
+    attempts = [dict(body)]
+    # 回退 1：geometry_quality 取值别名
+    gq = body.get("geometry_quality")
+    if gq in TRIPO_GEO_QUALITY_ALIASES:
+        alt = dict(body); alt["geometry_quality"] = TRIPO_GEO_QUALITY_ALIASES[gq]
+        attempts.append(alt)
+    # 回退 2：模型字段名 model_version <-> model
+    if "model_version" in body:
+        alt = dict(body); alt["model"] = alt.pop("model_version")
+        attempts.append(alt)
+    resp = None
+    for i, attempt in enumerate(attempts):
+        resp = await client.post(url, headers=headers, json=attempt)
+        if resp.status_code == 200:
+            return resp
+        if resp.status_code != 400:
+            return resp
+        detail = tripo_error_detail(resp).lower()
+        # 只在错误信息确实指向我们正在试的字段时才继续回退
+        relevant = ("geometry_quality" in detail) or ("model" in detail) or ("version" in detail)
+        if not relevant:
+            return resp
+    return resp
 
 def normalize_tripo_base_url(url):
     """旧 V2 地址自动映射到同区域 V3 端点（国内 .com / 国际 .ai 互不通用）。"""
@@ -13292,31 +13332,35 @@ async def tripo_create_task(payload: dict):
             body["original_model_task_id"] = original
         if task_type == "convert_model":
             body["format"] = (payload.get("format") or "GLB").strip().upper()
-    for key in ("texture", "pbr", "quad", "auto_size"):
+    stripped = []
+    for key in TRIPO_BOOL_PARAMS:
         if payload.get(key) is not None:
             body[key] = bool(payload.get(key))
-    for key in ("texture_quality", "texture_alignment", "orientation", "style"):
+    for key in TRIPO_STR_PARAMS:
         val = payload.get(key)
         if isinstance(val, str):
             val = val.strip()
         if val:
             body[key] = val
-    for key in ("face_limit", "texture_seed"):
+    for key in TRIPO_INT_PARAMS:
         if payload.get(key) not in (None, ""):
             try:
                 body[key] = int(payload.get(key))
             except (TypeError, ValueError):
                 pass
-    # P1 模型不接受这些几何参数（即使传 false/null 也会被上游拒绝）
+    if body.get("texture_quality") and body["texture_quality"] not in TRIPO_TEXTURE_QUALITIES:
+        body["texture_quality"] = "standard"
+    # models/texture 只接受 v3.0 / v2.5 两个贴图版本，其它值直接丢弃（让服务端用默认）
+    if task_type == "texture_model" and body.get("model_version") not in TRIPO_TEXTURE_MODEL_VERSIONS:
+        if body.pop("model_version", None):
+            stripped.append("model_version")
+    # P1 不接受这些几何参数（即使传 false/null 也会被上游拒绝）
     if str(body.get("model_version") or "").upper().startswith("P1"):
         for key in ("quad", "smart_low_poly", "generate_parts", "geometry_quality"):
-            body.pop(key, None)
+            if body.pop(key, None) is not None:
+                stripped.append(key)
     async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            f"{tripo_base_url()}{TRIPO_TASK_ENDPOINTS[task_type]}",
-            headers={**tripo_headers(), "Content-Type": "application/json"},
-            json=body,
-        )
+        resp = await tripo_submit_task(client, task_type, body)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"Tripo 任务创建失败：{tripo_error_detail(resp)}")
     data = resp.json()
@@ -13325,7 +13369,7 @@ async def tripo_create_task(payload: dict):
     task_id = (data.get("data") or {}).get("task_id")
     if not task_id:
         raise HTTPException(status_code=400, detail=f"Tripo 未返回 task_id：{data}")
-    return {"success": True, "task_id": task_id, "request": body}
+    return {"success": True, "task_id": task_id, "request": body, "stripped_params": stripped}
 
 @app.get("/api/tripo/task/{task_id}")
 async def tripo_query_task(task_id: str):

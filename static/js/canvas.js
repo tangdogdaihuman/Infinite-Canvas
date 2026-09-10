@@ -2631,12 +2631,16 @@ function addTripoNode(point){
         x:p.x,
         y:p.y,
         tripoMode:'multiview',
-        tripoModelVersion:(window.TripoAPI?.MODEL_VERSIONS?.[0]?.id) || 'v2.5-20250123',
+        tripoModelVersion:(window.TripoUI?.defaultModelForMode?.('multiview')) || 'v3.1-20260211',
         tripoTexture:true,
         tripoPbr:true,
         tripoQuad:false,
         tripoOrtho:true,
         tripoTextureQuality:'standard',
+        tripoGeometryQuality:'standard',
+        tripoSmartLowPoly:false,
+        tripoGenerateParts:false,
+        tripoAutofix:false,
         tripoFaceLimit:'',
         tripoPrompt:'',
         tripoViews:{front:'', back:'', left:'', right:''},
@@ -2644,6 +2648,9 @@ function addTripoNode(point){
         tripoTaskStatus:'',
         tripoProgress:0,
         tripoResult:null,
+        tripoHistory:[],
+        tripoStopped:false,
+        tripoModelPanelOpen:false,
         inputs:[],
         running:false
     });
@@ -3289,6 +3296,8 @@ async function pollTripoTask(node, taskId){
     try {
         while(true){
             await new Promise(r => setTimeout(r, 2500));
+            /* 前端"停止等待"：服务端任务不受影响，仍会继续并消耗点数 */
+            if(node.tripoStopped){ const e = new Error(tr('smart.tripoStopToast')); e.code = 'stopped'; throw e; }
             const data = await TripoAPI.queryTask(taskId);
             const task = data.task || {};
             node.tripoTaskStatus = task.status || '';
@@ -3321,7 +3330,15 @@ async function finalizeTripoTask(node, task, kind='model'){
     }
     if(!result.model && !result.preview) throw new Error(tr('canvas.tripoNoOutput'));
     node.tripoResult = result;
+    pushTripoHistory(node, result);
     return result;
+}
+/* 结果历史：保留最近 6 次生成结果，可在节点上切换对比（不再被新结果直接覆盖） */
+function pushTripoHistory(node, result){
+    if(!node || !result) return;
+    const list = Array.isArray(node.tripoHistory) ? node.tripoHistory.slice() : [];
+    if(!list.some(h => h && h.taskId && h.taskId === result.taskId)) list.push(result);
+    node.tripoHistory = list.slice(-6);
 }
 async function runTripoNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
@@ -3347,6 +3364,9 @@ async function runTripoNode(nodeId, opts={}){
             fileTokens = uploads.map(x => x.token);
             fileTypes = uploads.map(x => x.ext);
         }
+        const TT = window.TripoUI || {};
+        const capNow = (c) => (TT.modelSupports ? TT.modelSupports(node.tripoModelVersion, c) : false);
+        /* 只下发当前模型确实支持的参数——否则上游会报错或静默忽略，用户会以为生效了 */
         const payload = {
             task_type: collected.mode === 'multiview' ? 'multiview_to_model' : collected.mode === 'image' ? 'image_to_model' : 'text_to_model',
             model_version: node.tripoModelVersion || '',
@@ -3355,10 +3375,14 @@ async function runTripoNode(nodeId, opts={}){
             prompt: collected.prompt || '',
             texture: node.tripoTexture !== false,
             pbr: node.tripoPbr !== false,
-            quad: Boolean(node.tripoQuad),
             texture_quality: node.tripoTextureQuality || 'standard',
-            ortho_projection: node.tripoOrtho !== false
+            ortho_projection: node.tripoOrtho !== false,
+            autofix: Boolean(node.tripoAutofix)
         };
+        if(capNow('quad')) payload.quad = Boolean(node.tripoQuad);
+        if(capNow('smartLowPoly')) payload.smart_low_poly = Boolean(node.tripoSmartLowPoly);
+        if(capNow('generateParts')) payload.generate_parts = Boolean(node.tripoGenerateParts);
+        if(capNow('geoQuality') && node.tripoGeometryQuality) payload.geometry_quality = node.tripoGeometryQuality;
         if(node.tripoFaceLimit !== '' && node.tripoFaceLimit != null) payload.face_limit = Number(node.tripoFaceLimit);
         const created = await TripoAPI.createTask(payload);
         node.tripoTaskId = created.task_id;
@@ -3371,12 +3395,13 @@ async function runTripoNode(nodeId, opts={}){
         addGenerationLog({run, outputs:[result.preview || result.model].filter(Boolean), runMs:nowMs() - startedAt});
         window.TripoUI?.refreshBalance?.();
     } catch(err){
-        node.runStatus = 'failed';
-        node.runError = err.message || String(err);
+        const wasStopped = err?.code === 'stopped';
+        node.runStatus = wasStopped ? 'idle' : 'failed';
+        node.runError = wasStopped ? '' : (err.message || String(err));
         node.tripoTaskStatus = '';
-        addGenerationLog({run, outputs:[], runMs:nowMs() - startedAt, error:node.runError});
+        if(!wasStopped) addGenerationLog({run, outputs:[], runMs:nowMs() - startedAt, error:node.runError});
         if(opts.cascade) throw err;
-        else alert(node.runError);
+        else if(!wasStopped) alert(node.runError);
     } finally {
         node.running = false;
         refreshNodes([node.id]);
@@ -3459,7 +3484,19 @@ function renderTripoBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'generator-body tripo-body';
     const mode = node.tripoMode || 'multiview';
-    const versions = window.TripoAPI?.MODEL_VERSIONS || [{id:'v2.5-20250123', label:'Tripo v2.5'}];
+    const T = window.TripoUI || {};
+    /* 与模式联动：模型列表按当前模式过滤（四视图不显示 P1），旧节点的非法组合自动回落 */
+    const modelId = T.resolveModelForMode ? T.resolveModelForMode(node.tripoModelVersion, mode) : (node.tripoModelVersion || '');
+    const model = T.modelById ? T.modelById(modelId) : null;
+    const cap = (c) => (T.modelSupports ? T.modelSupports(modelId, c) : false);
+    const modeModels = T.modelsForMode ? T.modelsForMode(mode) : [];
+    const tl = (key, fallback) => { const v = window.StudioI18n?.t?.(key); return (v && v !== key) ? v : fallback; };
+    const qualityOptions = (T.TEXTURE_QUALITIES || []).map(q =>
+        `<option value="${escapeAttr(q.id)}" ${node.tripoTextureQuality === q.id ? 'selected' : ''}>${escapeHtml(q.label)} +${q.credits}</option>`).join('');
+    const geoOptions = (T.GEOMETRY_QUALITIES || []).map(q =>
+        `<option value="${escapeAttr(q.id)}" ${(node.tripoGeometryQuality || 'standard') === q.id ? 'selected' : ''}>${escapeHtml(q.label)}</option>`).join('');
+    const est = T.estimateCredits ? T.estimateCredits({mode, texture:node.tripoTexture !== false, textureQuality:node.tripoTextureQuality}) : null;
+    const history = Array.isArray(node.tripoHistory) ? node.tripoHistory : [];
     const views = node.tripoViews || {};
     const collected = tripoCollectInputs(node);
     const taskActive = node.running || ['queued','running'].includes(node.tripoTaskStatus);
@@ -3502,32 +3539,64 @@ function renderTripoBody(node){
         </div>
         <div class="ms-controls">
             <div class="gen-settings">
+                <div class="tripo-model-picker">
+                    <button type="button" class="tripo-model-current ${node.tripoModelPanelOpen ? 'open' : ''}" data-tripo-model-toggle>
+                        <span class="tripo-model-current-l">
+                            <span class="tripo-model-kicker">${escapeHtml(tl('smart.tripoModel', '模型'))}</span>
+                            <span class="tripo-model-current-name">${escapeHtml(model ? model.name : modelId)}</span>
+                        </span>
+                        <span class="tripo-model-current-r">
+                            ${model && model.recommended ? `<i class="tripo-model-star">${escapeHtml(tl('smart.tripoRecommended', '推荐'))}</i>` : ''}
+                            <i data-lucide="${node.tripoModelPanelOpen ? 'chevron-up' : 'chevron-down'}" class="w-4 h-4"></i>
+                        </span>
+                    </button>
+                    ${node.tripoModelPanelOpen ? `<div class="tripo-model-list">
+                        ${modeModels.map(m => `<button type="button" class="tripo-model-item ${m.id === modelId ? 'active' : ''}" data-tripo-model="${escapeAttr(m.id)}">
+                            <span class="tripo-model-body">
+                                <span class="tripo-model-head"><b>${escapeHtml(m.name)}</b>${m.recommended ? `<i class="tripo-model-star">${escapeHtml(tl('smart.tripoRecommended', '推荐'))}</i>` : ''}<em>${escapeHtml(m.tag || '')}</em></span>
+                                <span class="tripo-model-desc">${escapeHtml(m.desc || '')}</span>
+                            </span>
+                            <i data-lucide="${m.id === modelId ? 'check-circle-2' : 'circle'}" class="w-4 h-4 tripo-model-mark"></i>
+                        </button>`).join('')}
+                        <div class="tripo-model-note">${escapeHtml(tl('smart.tripoModelNote', '四视图不支持 P1，已在列表中隐藏'))}</div>
+                    </div>` : ''}
+                </div>
                 <div class="gen-settings-row">
-                    <select class="select-lite tripo-version-select" style="flex:1">
-                        ${versions.map(v => `<option value="${escapeAttr(v.id)}" ${node.tripoModelVersion === v.id ? 'selected' : ''}>${escapeHtml(v.label)}</option>`).join('')}
-                    </select>
-                    <select class="select-lite tripo-quality-select" title="${escapeAttr(tr('canvas.tripoTextureQuality'))}">
-                        <option value="standard" ${node.tripoTextureQuality !== 'detailed' ? 'selected' : ''}>${tr('canvas.tripoQualityStandard')}</option>
-                        <option value="detailed" ${node.tripoTextureQuality === 'detailed' ? 'selected' : ''}>${tr('canvas.tripoQualityDetailed')}</option>
-                    </select>
+                    <label class="field" style="flex:1">
+                        <div class="setting-title">${tr('canvas.tripoTextureQuality')}</div>
+                        <select class="select-lite tripo-quality-select">${qualityOptions}</select>
+                    </label>
+                    ${cap('geoQuality') ? `<label class="field" style="flex:1">
+                        <div class="setting-title">${escapeHtml(tl('smart.tripoGeometryQuality', '几何精度'))}</div>
+                        <select class="select-lite tripo-geo-select">${geoOptions}</select>
+                    </label>` : ''}
                 </div>
                 <div class="gen-settings-row tripo-checks">
                     <label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoTexture" ${node.tripoTexture !== false ? 'checked' : ''}><span>${tr('canvas.tripoTexture')}</span></label>
                     <label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoPbr" ${node.tripoPbr !== false ? 'checked' : ''}><span>PBR</span></label>
-                    <label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoQuad" ${node.tripoQuad ? 'checked' : ''}><span>Quad</span></label>
+                    ${cap('quad') ? `<label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoQuad" ${node.tripoQuad ? 'checked' : ''}><span>Quad</span></label>` : ''}
                     ${mode === 'multiview' ? `<label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoOrtho" ${node.tripoOrtho !== false ? 'checked' : ''}><span>${tr('canvas.tripoOrtho')}</span></label>` : ''}
+                    <label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoAutofix" ${node.tripoAutofix ? 'checked' : ''}><span>${escapeHtml(tl('smart.tripoAutofix', '修复输入图'))}</span></label>
                 </div>
                 <div class="gen-settings-row">
                     <label class="field" style="flex:1">
                         <div class="setting-title">${tr('canvas.tripoFaceLimit')}</div>
                         <input class="setting-input tripo-face-input" type="number" min="1000" step="1000" value="${escapeAttr(node.tripoFaceLimit || '')}" placeholder="Auto">
                     </label>
+                    ${cap('smartLowPoly') ? `<label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoSmartLowPoly" ${node.tripoSmartLowPoly ? 'checked' : ''}><span>${tr('canvas.tripoSmartLowPoly')}</span></label>` : ''}
+                    ${cap('parts') ? `<label class="setting-check"><input type="checkbox" class="tripo-check" data-field="tripoGenerateParts" ${node.tripoGenerateParts ? 'checked' : ''}><span>${escapeHtml(tl('smart.tripoParts', '自动分件'))}</span></label>` : ''}
                 </div>
+                ${est ? `<div class="tripo-estimate">
+                    <i data-lucide="coins" class="w-3.5 h-3.5"></i>
+                    <span>${escapeHtml(tl('smart.tripoEstimate', '预计'))} <b>${est.min}–${est.max}</b> ${escapeHtml(tl('smart.tripoCredits', '点'))}</span>
+                    <span class="tripo-estimate-detail">${escapeHtml(est.parts.map(p => `${p.label} ${p.text}`).join(' · '))}</span>
+                </div>` : ''}
             </div>
             <div class="gen-run-row">
                 <button class="gen-btn tripo-run-btn ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}>
                     <i data-lucide="box" class="w-4 h-4"></i>${node.running ? tr('canvas.generating') : tr('canvas.tripoGenerate')}
                 </button>
+                ${taskActive ? `<button class="secondary-btn tripo-stop-btn" title="${escapeAttr(tl('smart.tripoStopHint', '服务端任务仍会继续并消耗点数'))}"><i data-lucide="square" class="w-3.5 h-3.5"></i>${escapeHtml(tl('smart.tripoStop', '停止等待'))}</button>` : ''}
                 ${cascadeBtnHtml(node)}
             </div>
             ${retryBarHtml(node)}
@@ -3539,9 +3608,15 @@ function renderTripoBody(node){
             ${result ? `
             <div class="tripo-result">
                 <div class="tripo-viewer"></div>
+                ${history.length > 1 ? `<div class="tripo-history">
+                    ${history.map((h, i) => `<button type="button" class="tripo-history-item ${node.tripoResult === h ? 'active' : ''}" data-tripo-history="${i}" title="${escapeAttr(h.taskId || '')}">
+                        ${h.preview ? `<img src="${escapeAttr(h.preview)}" alt="" draggable="false">` : `<i data-lucide="box" class="w-4 h-4"></i>`}
+                    </button>`).join('')}
+                </div>` : ''}
                 <div class="tripo-result-actions">
                     ${result.model ? `<a class="secondary-btn tripo-download-btn" href="${escapeAttr(result.model)}" download title="${escapeAttr(result.model)}"><i data-lucide="download" class="w-3.5 h-3.5"></i><span>GLB</span></a>` : ''}
                     <button type="button" class="secondary-btn tripo-retexture-btn" ${node.running ? 'disabled' : ''}><i data-lucide="palette" class="w-3.5 h-3.5"></i><span>${tr('canvas.tripoRetexture')}</span></button>
+                    <button type="button" class="secondary-btn tripo-refine-btn" ${node.running ? 'disabled' : ''} title="${escapeAttr(tl('smart.tripoRefineHint', '把草模精修成高精度模型'))}"><i data-lucide="sparkles" class="w-3.5 h-3.5"></i><span>${escapeHtml(tl('smart.tripoRefine', '精修'))}</span></button>
                     <span class="tripo-convert-group">
                         <select class="select-lite tripo-convert-format">
                             <option value="GLB">GLB</option><option value="FBX">FBX</option><option value="OBJ">OBJ</option><option value="USDZ">USDZ</option><option value="STL">STL</option>
@@ -3562,7 +3637,10 @@ function renderTripoBody(node){
         btn.onclick = e => {
             e.stopPropagation();
             if(node.tripoMode !== btn.dataset.tmode){
-                node.tripoMode = btn.dataset.tmode;
+                const next = btn.dataset.tmode;
+                node.tripoMode = next;
+                /* 模式切换后，若当前模型在新模式下不可用（如 P1 → 四视图），自动回落到该模式默认模型 */
+                if(window.TripoUI?.resolveModelForMode) node.tripoModelVersion = window.TripoUI.resolveModelForMode(node.tripoModelVersion, next);
                 refreshNodes([node.id]);
                 scheduleSave();
             }
@@ -3591,12 +3669,39 @@ function renderTripoBody(node){
             scheduleSave();
         };
     });
-    const versionSelect = wrap.querySelector('.tripo-version-select');
-    if(versionSelect) versionSelect.onchange = () => { node.tripoModelVersion = versionSelect.value; scheduleSave(); };
+    /* 模型选择面板 */
+    const modelToggle = wrap.querySelector('[data-tripo-model-toggle]');
+    if(modelToggle) modelToggle.onclick = e => {
+        e.stopPropagation();
+        node.tripoModelPanelOpen = !node.tripoModelPanelOpen;
+        refreshNodes([node.id]);
+    };
+    wrap.querySelectorAll('[data-tripo-model]').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            node.tripoModelVersion = btn.dataset.tripoModel;
+            node.tripoModelPanelOpen = false;
+            /* 换模型后把该模型不支持的勾选复位，避免"勾了但无效" */
+            const capNow = (c) => (window.TripoUI?.modelSupports ? window.TripoUI.modelSupports(node.tripoModelVersion, c) : false);
+            if(!capNow('quad')) node.tripoQuad = false;
+            if(!capNow('smartLowPoly')) node.tripoSmartLowPoly = false;
+            if(!capNow('generateParts')) node.tripoGenerateParts = false;
+            if(!capNow('geoQuality')) node.tripoGeometryQuality = 'standard';
+            refreshNodes([node.id]);
+            scheduleSave();
+        };
+    });
     const qualitySelect = wrap.querySelector('.tripo-quality-select');
-    if(qualitySelect) qualitySelect.onchange = () => { node.tripoTextureQuality = qualitySelect.value; scheduleSave(); };
+    if(qualitySelect) qualitySelect.onchange = () => { node.tripoTextureQuality = qualitySelect.value; refreshNodes([node.id]); scheduleSave(); };
+    const geoSelect = wrap.querySelector('.tripo-geo-select');
+    if(geoSelect) geoSelect.onchange = () => { node.tripoGeometryQuality = geoSelect.value; scheduleSave(); };
     wrap.querySelectorAll('.tripo-check').forEach(chk => {
-        chk.onchange = () => { node[chk.dataset.field] = chk.checked; scheduleSave(); };
+        chk.onchange = () => {
+            node[chk.dataset.field] = chk.checked;
+            /* 贴图开关会改变"贴图质量"的可用性，需要重绘 */
+            if(chk.dataset.field === 'tripoTexture') refreshNodes([node.id]);
+            scheduleSave();
+        };
     });
     const faceInput = wrap.querySelector('.tripo-face-input');
     if(faceInput) faceInput.onchange = () => { node.tripoFaceLimit = faceInput.value; scheduleSave(); };
@@ -3605,16 +3710,36 @@ function renderTripoBody(node){
     const runBtn = wrap.querySelector('.tripo-run-btn');
     if(runBtn){
         runBtn.onmousedown = e => e.stopPropagation();
-        runBtn.onclick = e => { e.stopPropagation(); runTripoNode(node.id); };
+        runBtn.onclick = e => { e.stopPropagation(); node.tripoStopped = false; node.tripoError = ''; runTripoNode(node.id); };
     }
+    /* 停止等待：仅前端停止轮询，服务端任务仍在跑 */
+    const stopBtn = wrap.querySelector('.tripo-stop-btn');
+    if(stopBtn) stopBtn.onclick = e => {
+        e.stopPropagation();
+        node.tripoStopped = true;
+        alert(tr('smart.tripoStopToast'));
+    };
     const retextureBtn = wrap.querySelector('.tripo-retexture-btn');
     if(retextureBtn) retextureBtn.onclick = e => { e.stopPropagation(); runTripoPostProcess(node.id, 'texture_model'); };
+    const refineBtn = wrap.querySelector('.tripo-refine-btn');
+    if(refineBtn) refineBtn.onclick = e => { e.stopPropagation(); runTripoPostProcess(node.id, 'refine_model'); };
     const convertBtn = wrap.querySelector('.tripo-convert-btn');
     if(convertBtn) convertBtn.onclick = e => {
         e.stopPropagation();
         const format = wrap.querySelector('.tripo-convert-format')?.value || 'GLB';
         runTripoPostProcess(node.id, 'convert_model', {format});
     };
+    wrap.querySelectorAll('[data-tripo-history]').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            const list = Array.isArray(node.tripoHistory) ? node.tripoHistory : [];
+            const item = list[Number(btn.dataset.tripoHistory)];
+            if(!item) return;
+            node.tripoResult = item;
+            refreshNodes([node.id]);
+            scheduleSave();
+        };
+    });
     bindCascadeButtons(wrap, node.id);
     // 3D 预览
     if(result?.model){

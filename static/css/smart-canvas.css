@@ -1628,3 +1628,44 @@ input[type=range].smart-range::-webkit-slider-thumb { -webkit-appearance:none; w
     .tripo-balance-smart{ right:206px; width:40px; padding:0; }
     .tripo-balance-smart span{ display:none; }
 }
+/* ===== Tripo 节点增强：模型选择器 / 参数分组 / 点数估算 / 结果历史 =====
+   颜色全部走 theme.css 变量，浅色与深色主题都适用 */
+.tripo-model-picker{position:relative;margin:8px 0}
+.tripo-model-current{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:var(--soft);color:var(--text);cursor:pointer;text-align:left;transition:border-color .15s,background .15s}
+.tripo-model-current:hover{border-color:var(--accent)}
+.tripo-model-current.open{border-color:var(--accent);background:var(--soft-2)}
+.tripo-model-current-l{display:flex;flex-direction:column;gap:2px;min-width:0}
+.tripo-model-kicker{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.tripo-model-current-name{font-size:13px;font-weight:600;color:var(--text-main);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tripo-model-current-r{display:flex;align-items:center;gap:6px;flex:none;color:var(--muted)}
+.tripo-model-star{font-style:normal;font-size:10px;font-weight:600;padding:1px 6px;border-radius:999px;background:var(--accent);color:#fff}
+.tripo-model-list{position:absolute;z-index:40;left:0;right:0;top:calc(100% + 4px);max-height:300px;overflow:auto;padding:6px;border:1px solid var(--line);border-radius:12px;background:var(--card-solid,var(--card));box-shadow:var(--shadow)}
+.tripo-model-item{display:flex;align-items:flex-start;gap:8px;width:100%;padding:8px;border:0;border-radius:8px;background:transparent;color:var(--text);cursor:pointer;text-align:left}
+.tripo-model-item:hover{background:var(--soft)}
+.tripo-model-item.active{background:var(--soft-2);box-shadow:inset 0 0 0 1px var(--accent)}
+.tripo-model-body{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}
+.tripo-model-head{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12.5px}
+.tripo-model-head b{color:var(--text-main)}
+.tripo-model-head em{font-style:normal;font-size:10.5px;color:var(--muted)}
+.tripo-model-desc{font-size:11px;line-height:1.45;color:var(--muted)}
+.tripo-model-mark{flex:none;color:var(--accent);margin-top:2px}
+.tripo-model-note{padding:6px 8px 2px;margin-top:4px;font-size:10.5px;color:var(--muted);border-top:1px dashed var(--line)}
+.tripo-field{display:flex;flex-direction:column;gap:3px;flex:1;min-width:0}
+.tripo-field-label{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.tripo-face-input{width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--soft);color:var(--text);font-size:12px}
+.tripo-face-input:focus{outline:none;border-color:var(--accent)}
+.tripo-check-wide{flex:0 0 auto}
+.tripo-fill-btn{display:inline-flex;align-items:center;gap:4px;margin-left:6px;padding:2px 8px;border:1px solid var(--line);border-radius:999px;background:var(--soft);color:var(--text);font-size:10.5px;cursor:pointer}
+.tripo-fill-btn:hover{border-color:var(--accent);color:var(--accent)}
+.tripo-estimate{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0;padding:6px 10px;border:1px dashed var(--line);border-radius:10px;background:var(--soft);font-size:11.5px;color:var(--text)}
+.tripo-estimate b{color:var(--accent)}
+.tripo-estimate-detail{flex:1 0 100%;font-size:10.5px;color:var(--muted)}
+.tripo-run-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.tripo-stop-btn,.tripo-retry-btn{display:inline-flex;align-items:center;gap:4px;padding:6px 10px;border:1px solid var(--line);border-radius:9px;background:var(--soft);color:var(--text);font-size:11.5px;cursor:pointer}
+.tripo-stop-btn:hover{border-color:#e08c3c;color:#e08c3c}
+.tripo-retry-btn:hover{border-color:var(--accent);color:var(--accent)}
+.tripo-history{display:flex;gap:6px;overflow-x:auto;padding:6px 0}
+.tripo-history-item{flex:none;display:flex;align-items:center;justify-content:center;width:46px;height:46px;padding:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--soft);color:var(--muted);cursor:pointer}
+.tripo-history-item img{display:block;width:100%;height:100%;object-fit:cover}
+.tripo-history-item.active{border-color:var(--accent);box-shadow:inset 0 0 0 2px var(--accent)}
+.tripo-convert-group{display:inline-flex;align-items:center;gap:4px}

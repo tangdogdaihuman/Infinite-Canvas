@@ -44,6 +44,7 @@
         "bulk.selectedCount": { zh: "已选 {n} 张", en: "{n} selected" },
         "bulk.deleteConfirm": { zh: "确认删除选中的 {n} 张图片？此操作不可恢复。", en: "Delete the selected {n} image(s)? This cannot be undone." },
         "bulk.deleting": { zh: "删除中…", en: "Deleting…" },
-        "bulk.noSelection": { zh: "请先选择要删除的图片", en: "Select images to delete first" }
+        "bulk.noSelection": { zh: "请先选择要删除的图片", en: "Select images to delete first" },
+      "common.retry": { zh: "重试", en: "Retry" },
     });
 })();
