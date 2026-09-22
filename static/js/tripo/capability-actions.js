@@ -72,30 +72,32 @@ const drafts = new WeakMap();
 const openState = new WeakMap();
 const draftFor = node => { let d = drafts.get(node); if(!d){ d = {}; drafts.set(node, d); } return d; };
 const openFor = node => { let s = openState.get(node); if(!s){ s = new Set(); openState.set(node, s); } return s; };
+/* HTML 属性值转义：草稿值会回填进 value="..."，防引号破属性注入 */
+const escAttr = str => String(str == null ? '' : str).replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
 
 function fieldHtml(p, value){
     const v = value !== undefined ? value : p.default;
-    const hint = p.hint ? `<div class="tca-hint">${p.hint}</div>` : '';
+    const hint = p.hint ? `<div class="tca-hint">${escAttr(p.hint)}</div>` : '';
     if(p.type === 'bool'){
         return `<label class="tca-check" data-field="${p.name}">
             <input type="checkbox" data-cap-field="${p.name}" ${v ? 'checked' : ''}>
-            <span>${p.label}</span>${hint ? '' : ''}</label>`;
+            <span>${escAttr(p.label)}</span>${hint ? '' : ''}</label>`;
     }
     if(p.type === 'enum'){
-        const opts = (p.options || []).map(o => `<option value="${o}" ${o === v ? 'selected' : ''}>${o}</option>`).join('');
-        return `<div class="tca-field" data-field="${p.name}"><span class="tca-label">${p.label}</span>
+        const opts = (p.options || []).map(o => `<option value="${escAttr(o)}" ${o === v ? 'selected' : ''}>${escAttr(o)}</option>`).join('');
+        return `<div class="tca-field" data-field="${p.name}"><span class="tca-label">${escAttr(p.label)}</span>
             <select class="tca-select" data-cap-field="${p.name}">${opts}</select>${hint}</div>`;
     }
     if(p.type === 'int' || p.type === 'float'){
         const step = p.type === 'int' ? '1' : 'any';
         const attrs = `${p.min !== null && p.min !== undefined ? `min="${p.min}"` : ''} ${p.max !== null && p.max !== undefined ? `max="${p.max}"` : ''}`;
-        return `<div class="tca-field" data-field="${p.name}"><span class="tca-label">${p.label}</span>
-            <input class="tca-input" type="number" step="${step}" ${attrs} data-cap-field="${p.name}" value="${v ?? ''}">${hint}</div>`;
+        return `<div class="tca-field" data-field="${p.name}"><span class="tca-label">${escAttr(p.label)}</span>
+            <input class="tca-input" type="number" step="${step}" ${attrs} data-cap-field="${p.name}" value="${escAttr(v ?? '')}">${hint}</div>`;
     }
     /* str / list：单行文本，list 用逗号分隔 */
     const ph = p.type === 'list' ? (p.hint || '逗号分隔') : (p.hint || '');
-    return `<div class="tca-field wide" data-field="${p.name}"><span class="tca-label">${p.label}</span>
-        <input class="tca-input" type="text" data-cap-field="${p.name}" value="${v ?? ''}" placeholder="${ph}"></div>`;
+    return `<div class="tca-field wide" data-field="${p.name}"><span class="tca-label">${escAttr(p.label)}</span>
+        <input class="tca-input" type="text" data-cap-field="${p.name}" value="${escAttr(v ?? '')}" placeholder="${escAttr(ph)}"></div>`;
 }
 
 function collectParams(cardEl, cap){
@@ -115,15 +117,15 @@ function collectParams(cardEl, cap){
 function cardHtml(cap, draft, isOpen, busy, infoText){
     const fields = (cap.params || []).map(p => fieldHtml(p, draft[p.name])).join('');
     const cost = cap.cost === 0 ? '免费' : `约 ${cap.cost} 点`;
-    const info = infoText ? `<div class="tca-info">${infoText}</div>` : '';
-    return `<div class="tca-card ${isOpen ? 'open' : ''}" data-cap="${cap.id}">
+    const info = infoText ? `<div class="tca-info">${escAttr(infoText)}</div>` : '';
+    return `<div class="tca-card ${isOpen ? 'open' : ''}" data-cap="${escAttr(cap.id)}">
         <button class="tca-head" type="button" data-tca-toggle>
-            <span class="tca-name">${cap.label}</span>
-            <span class="tca-cost">${cost}</span>
+            <span class="tca-name">${escAttr(cap.label)}</span>
+            <span class="tca-cost">${escAttr(cost)}</span>
             <span class="tca-caret">▾</span>
         </button>
         <div class="tca-body">
-            ${cap.desc ? `<div class="tca-desc">${cap.desc}</div>` : ''}
+            ${cap.desc ? `<div class="tca-desc">${escAttr(cap.desc)}</div>` : ''}
             ${info}
             ${fields ? `<div class="tca-fields">${fields}</div>` : ''}
             <button class="tca-run" type="button" data-tca-run ${busy ? 'disabled' : ''}>${busy ? '任务进行中…' : '执行'}</button>

@@ -4,9 +4,11 @@ Tripo CDN 的 URL 后缀与实际内容偶尔不符（如 rendered_image_url 结
 内容却是 PNG），而前端按扩展名选预览器（glb/gltf → GLTFLoader，fbx → FBXLoader），
 后缀写错会直接预览失败，因此保存前以魔数为准纠正。
 """
+import ipaddress
 import os
 import re
 import time
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import HTTPException
@@ -14,6 +16,29 @@ from fastapi import HTTPException
 from .config import TRIPO_OUTPUT_DIR
 
 _OUTPUT_URL_PREFIX = "/output/tripo"
+
+
+def _assert_public_url(url: str):
+    """SSRF 防御（个人本地应用级别）：拒绝指向本机/内网的**字面量**地址。
+
+    注意：不做 DNS 解析预检——本机常开 Clash 等代理（fake-ip 段属保留地址），
+    域名解析结果不代表真实连接目标（httpx 走代理时连的是代理服务器），
+    解析预检会把所有域名误杀；字面量拦截已覆盖最常见的 SSRF 直连探测。
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="无效的下载地址")
+    if not host:
+        raise HTTPException(status_code=400, detail="无效的下载地址")
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local") or host.endswith(".internal"):
+        raise HTTPException(status_code=400, detail="不允许下载内网地址")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return  # 普通域名（CDN 等）放行，交由 httpx/系统代理完成真实连接
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+        raise HTTPException(status_code=400, detail="不允许下载内网地址")
 
 
 def sniff_binary_ext(content: bytes) -> str:
@@ -47,6 +72,7 @@ async def download_remote(url: str, kind: str = "model", name_hint: str = "") ->
     url = (url or "").strip()
     if not url.startswith("http"):
         raise HTTPException(status_code=400, detail="无效的下载地址")
+    _assert_public_url(url)
     kind = _clean_fragment(kind or "model", 20) or "model"
     name_hint = _clean_fragment(name_hint, 40)
     ext = ".glb"
