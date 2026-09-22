@@ -44,3 +44,13 @@ __pycache__/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# ---------- 密钥目录与本地备份 / 测试产物 ----------
+API/
+outputs/
+*.bak-*
+*.before-*
+*_test.png
+data/*.bak-*
+data/*.before-*
+data/*.before-*-*

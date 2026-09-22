@@ -3495,7 +3495,7 @@ function renderTripoBody(node){
         `<option value="${escapeAttr(q.id)}" ${node.tripoTextureQuality === q.id ? 'selected' : ''}>${escapeHtml(q.label)} +${q.credits}</option>`).join('');
     const geoOptions = (T.GEOMETRY_QUALITIES || []).map(q =>
         `<option value="${escapeAttr(q.id)}" ${(node.tripoGeometryQuality || 'standard') === q.id ? 'selected' : ''}>${escapeHtml(q.label)}</option>`).join('');
-    const est = T.estimateCredits ? T.estimateCredits({mode, texture:node.tripoTexture !== false, textureQuality:node.tripoTextureQuality}) : null;
+    const est = T.estimateCredits ? T.estimateCredits({mode, texture:node.tripoTexture !== false, textureQuality:node.tripoTextureQuality, modelId}) : null;
     const history = Array.isArray(node.tripoHistory) ? node.tripoHistory : [];
     const views = node.tripoViews || {};
     const collected = tripoCollectInputs(node);
@@ -3588,7 +3588,7 @@ function renderTripoBody(node){
                 </div>
                 ${est ? `<div class="tripo-estimate">
                     <i data-lucide="coins" class="w-3.5 h-3.5"></i>
-                    <span>${escapeHtml(tl('smart.tripoEstimate', '预计'))} <b>${est.min}–${est.max}</b> ${escapeHtml(tl('smart.tripoCredits', '点'))}</span>
+                    <span>${escapeHtml(tl('smart.tripoEstimate', '预计'))} <b>${est.min === est.max ? est.min : `${est.min}–${est.max}`}</b> ${escapeHtml(tl('smart.tripoCredits', '点'))}</span>
                     <span class="tripo-estimate-detail">${escapeHtml(est.parts.map(p => `${p.label} ${p.text}`).join(' · '))}</span>
                 </div>` : ''}
             </div>

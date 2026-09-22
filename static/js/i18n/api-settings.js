@@ -146,6 +146,7 @@
         "api.clearRhWalletKeyTitle": { zh: "清除账户余额 Key", en: "Clear Balance Key" },
         "api.recommendPanelTitle": { zh: "推荐API", en: "Recommended APIs" },
         "api.recommendPanelSub": { zh: "获取 Key 后保存，右侧会切换到刚保存的平台配置。", en: "Get a key and save it; the right panel will switch to that provider's settings." },
+        "api.backToProviders": { zh: "返回平台配置", en: "Back to Providers" },
         "api.recommendPanelHintTitle": { zh: "推荐多平台注册", en: "Register Multiple Providers" },
         "api.recommendPanelHintDesc": { zh: "少量充值，即用即冲。", en: "Top up lightly and recharge as you go." },
         "api.recommendQuickSetup": { zh: "快捷设置", en: "Quick Setup" },

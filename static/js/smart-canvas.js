@@ -1327,6 +1327,7 @@ function syncSelectionUi(){
     syncSmartSelectedImageResolution(world);
     syncRunButtonState();
     scheduleConnectionLayerRefresh();
+    syncSmartTripoPanel();
 }
 function isNodeSelected(id){
     return selectedId === id || selectedIds.includes(id);
@@ -1916,6 +1917,10 @@ function imageLayout(images, scale=1, node=null){
         if(groupThumbLayout) return groupThumbLayout;
         return {cols:1, rows:1, ...smartGroupLayoutSize(node), thumb:96, single:true};
     }
+    if(node?.type === 'smart-tripo'){
+        const side = Math.max(240, Math.round(Number(node.w) || 420));
+        return {cols:1, rows:1, width:side, height:side, thumb:96, single:true};
+    }
     if(node?.type === 'smart-prompt') return {cols:1, rows:1, ...promptNodeLayoutSize(node), thumb:96, single:true};
     if(node?.type === 'smart-minimax') return {cols:1, rows:1, ...smartMinimaxLayoutSize(node), thumb:96, single:true};
     if(node?.type === 'smart-loop'){
@@ -2125,6 +2130,7 @@ function applyViewport(){
     shell.style.backgroundPosition = '0 0';
     renderMinimap();
     scheduleSmartImageResolutionSync(world, 120);
+    positionSmartTripoPanel();
 }
 function screenToWorld(event){
     const rect = shell.getBoundingClientRect();
@@ -6229,8 +6235,8 @@ function createTripoNode(x, y, options={}){
         type:'smart-tripo',
         x,
         y,
-        w:440,
-        h:620,
+        w:420,
+        h:420,
         title:'Tripo 3D',
         tripoMode:'multiview',
         tripoModelVersion:T?.defaultModelForMode?.('multiview') || 'v3.1-20260211',
@@ -6269,7 +6275,27 @@ const SMART_TRIPO_SLOTS = [
     {key:'left', label:'左视图'},
     {key:'right', label:'右视图'}
 ];
+// 面板关闭与参数展开状态属于画布 UI，不写入节点数据。
+let smartTripoPanel = null;
+let smartTripoPanelNodeId = '';
+let smartTripoPanelDismissedId = '';
+const smartTripoOptionsOpen = new Set();
 function smartTripoBodyHtml(node){
+    const T = window.TripoUI;
+    const modelId = T?.resolveModelForMode?.(node.tripoModelVersion, node.tripoMode || 'multiview') || node.tripoModelVersion;
+    const name = T?.modelById?.(modelId)?.name || modelId || 'Tripo 3D';
+    const result = node.tripoResult;
+    const active = node.running || ['queued', 'running'].includes(node.tripoTaskStatus);
+    return `<div class="smart-tripo-card">
+        <div class="tripo-card-title"><i data-lucide="box"></i><span>模型生成</span></div>
+        <div class="tripo-card-preview">
+            ${result?.model ? `<div class="tripo-viewer" data-tripo-viewer-stage="1" data-tripo-viewer-url="${escapeHtml(result.model)}"></div>` : `<div class="tripo-card-empty"><i data-lucide="box"></i></div>`}
+            ${active ? `<div class="tripo-card-status"><div class="tripo-progress-track"><div class="tripo-progress-fill" style="width:${Math.max(0, Math.min(100, Number(node.tripoProgress) || 0))}%"></div></div><span class="tripo-progress-label">生成中 ${Math.max(0, Math.min(100, Number(node.tripoProgress) || 0))}%</span></div>` : node.tripoError ? `<div class="tripo-card-status tripo-error">生成失败 · 打开设置查看详情</div>` : ''}
+        </div>
+        <button type="button" class="tripo-card-caption" data-tripo-open title="打开模型生成设置"><i data-lucide="box"></i><span>${escapeHtml(name)}</span><i data-lucide="chevron-right"></i></button>
+    </div>`;
+}
+function smartTripoPanelHtml(node){
     const T = window.TripoUI || {};
     /* tr() 在缺 i18n key 时返回 key 本身，因此需要一个能真正回退到中文的封装 */
     const tl = (key, fallback) => { const v = window.StudioI18n?.t?.(key); return (v && v !== key) ? v : fallback; };
@@ -6284,23 +6310,18 @@ function smartTripoBodyHtml(node){
     const taskActive = node.running || ['queued','running'].includes(node.tripoTaskStatus);
     const upstreamImgs = inputNodesFor(node).flatMap(n => imagesForNode(n)).filter(img => img?.url);
     const upstreamCount = upstreamImgs.length;
-    const est = T.estimateCredits ? T.estimateCredits({mode, texture:node.tripoTexture !== false, textureQuality:node.tripoTextureQuality}) : null;
+    const est = T.estimateCredits ? T.estimateCredits({mode, texture:node.tripoTexture !== false, textureQuality:node.tripoTextureQuality, modelId}) : null;
     const history = Array.isArray(node.tripoHistory) ? node.tripoHistory : [];
     const result = node.tripoResult || null;
 
     const slotHtml = (slot) => {
         const url = views[slot.key] || '';
-        if(url){
-            return `<div class="tripo-slot filled" data-slot="${slot.key}">
-                <img src="${escapeHtml(url)}" alt="${escapeHtml(slot.label)}" draggable="false">
-                <span class="tripo-slot-tag">${escapeHtml(slot.label)}</span>
-                <button type="button" class="tripo-slot-clear" data-tripo-clear="${slot.key}" title="${escapeHtml(tl('common.delete', '删除'))}">×</button>
-            </div>`;
-        }
-        return `<div class="tripo-slot" data-slot="${slot.key}">
-            <button type="button" class="tripo-slot-upload" data-tripo-upload="${slot.key}">
-                <i data-lucide="image-plus" class="w-4 h-4"></i><span>${escapeHtml(slot.label)}</span>
+        const label = ({front:'正面', left:'左', right:'右', back:'背面'})[slot.key];
+        return `<div class="tripo-slot ${url ? 'filled' : ''}" data-slot="${slot.key}">
+            <button type="button" class="tripo-slot-upload" data-tripo-upload="${slot.key}" title="${url ? '替换' : '上传'}${label}图片" aria-label="${url ? '替换' : '上传'}${label}图片">
+                ${url ? `<img src="${escapeHtml(url)}" alt="${label}" draggable="false">` : `<i data-lucide="${slot.key === 'front' ? 'user-round' : 'scan-face'}"></i><span class="tripo-upload-title">${slot.key === 'front' ? '点击上传 · 正面' : label}</span>${slot.key === 'front' ? '<span class="tripo-upload-meta">JPG、PNG、WEBP · 支持拖入图片</span>' : ''}`}
             </button>
+            ${url ? `<span class="tripo-slot-tag">${label}</span><button type="button" class="tripo-slot-clear" data-tripo-clear="${slot.key}" title="删除${label}图片" aria-label="删除${label}图片">×</button>` : ''}
         </div>`;
     };
     const modeLabel = (m) => (T.MODE_LABELS && T.MODE_LABELS[m]) || (m === 'image' ? '单图' : m === 'text' ? '文生' : '四视图');
@@ -6310,10 +6331,13 @@ function smartTripoBodyHtml(node){
         `<option value="${escapeHtml(q.id)}" ${(node.tripoGeometryQuality || 'standard') === q.id ? 'selected' : ''}>${escapeHtml(q.label)}</option>`).join('');
     const modelItems = modeModels.map(m => {
         const active = m.id === modelId;
-        return `<button type="button" class="tripo-model-item ${active ? 'active' : ''}" data-tripo-model="${escapeHtml(m.id)}">
+        const tags = [m.modes.includes('multiview') ? '四视图' : '单图 / 文字', ...(m.caps || []).includes('smartLowPoly') ? ['智能低模'] : [], ...(m.caps || []).includes('generateParts') ? ['自动分件'] : []];
+        return `<button type="button" class="tripo-model-item ${active ? 'active' : ''}" data-tripo-model="${escapeHtml(m.id)}" role="option" aria-selected="${active}">
+            <span class="tripo-model-brand"><i data-lucide="box"></i></span>
             <span class="tripo-model-body">
                 <span class="tripo-model-head"><b>${escapeHtml(m.name)}</b>${m.recommended ? `<i class="tripo-model-star">${escapeHtml(tl('smart.tripoRecommended', '推荐'))}</i>` : ''}<em>${escapeHtml(m.tag || '')}</em></span>
                 <span class="tripo-model-desc">${escapeHtml(m.desc || '')}</span>
+                <span class="tripo-model-tags">${tags.map(tag => `<span>${escapeHtml(tag)}</span>`).join('')}</span>
             </span>
             <i data-lucide="${active ? 'check-circle-2' : 'circle'}" class="w-4 h-4 tripo-model-mark"></i>
         </button>`;
@@ -6322,11 +6346,19 @@ function smartTripoBodyHtml(node){
         `<label class="tripo-check"><input type="checkbox" data-tripo-check="${key}" ${checked ? 'checked' : ''}><span>${escapeHtml(label)}</span></label>`;
 
     return `<div class="tripo-body smart-tripo-body">
-        <div class="tripo-mode-tabs">
-            ${['image','multiview','text'].map(m => `<button type="button" data-tripo-mode="${m}" class="${mode === m ? 'active' : ''}">${escapeHtml(modeLabel(m))}</button>`).join('')}
+        <div class="tripo-model-picker">
+            <div class="tripo-section-label">模型选择</div>
+            <button type="button" class="tripo-model-current ${node.tripoModelPanelOpen ? 'open' : ''}" data-tripo-model-toggle aria-haspopup="listbox" aria-expanded="${Boolean(node.tripoModelPanelOpen)}">
+                <span class="tripo-model-current-l"><span class="tripo-model-brand"><i data-lucide="box"></i></span><span class="tripo-model-current-name">${escapeHtml(model ? model.name : modelId)}</span></span>
+                <i data-lucide="chevron-right" class="w-4 h-4"></i>
+            </button>
+            ${node.tripoModelPanelOpen ? `<div class="tripo-model-list tripo-model-popover" role="listbox" aria-label="可用的 Tripo 模型">${modelItems}<div class="tripo-model-note">${mode === 'multiview' ? '当前为四视图模式，已隐藏不支持的 P1 模型。' : '仅显示已接入的 Tripo 模型。'}</div></div>` : ''}
+        </div>
+        <div class="tripo-mode-tabs" role="group" aria-label="生成方式">
+            ${['image','multiview','text'].map(m => `<button type="button" data-tripo-mode="${m}" title="${escapeHtml(modeLabel(m))}" aria-pressed="${mode === m}" class="${mode === m ? 'active' : ''}"><i data-lucide="${({image:'image-plus',multiview:'box',text:'text-cursor-input'})[m]}"></i><span>${({image:'单图',multiview:'四视图',text:'文字'})[m]}</span></button>`).join('')}
         </div>
         ${mode === 'multiview' ? `
-        <div class="tripo-view-slots">${SMART_TRIPO_SLOTS.map(slotHtml).join('')}</div>
+        <div class="tripo-view-slots">${['front','left','right','back'].map(key => slotHtml(SMART_TRIPO_SLOTS.find(s => s.key === key))).join('')}</div>
         <div class="tripo-linked-hint">
             <span>${escapeHtml(tlf('smart.tripoLinkedHint', {count:upstreamCount}, '空槽位将按顺序使用连线输入图片'))}</span>
             ${upstreamCount ? `<button type="button" class="tripo-fill-btn" data-tripo-fill><i data-lucide="wand-2" class="w-3 h-3"></i>${escapeHtml(tl('smart.tripoFillFromLinks', '从连线填充'))}</button>` : ''}
@@ -6340,22 +6372,9 @@ function smartTripoBodyHtml(node){
         ${mode === 'text' ? `
         <textarea class="tripo-prompt-input" rows="3" placeholder="${escapeHtml(tl('smart.tripoPromptPlaceholder', '描述要生成的 3D 模型…（可连线 Prompt 节点）'))}">${escapeHtml(node.tripoPrompt || '')}</textarea>` : ''}
 
-        <div class="tripo-model-picker">
-            <button type="button" class="tripo-model-current ${node.tripoModelPanelOpen ? 'open' : ''}" data-tripo-model-toggle>
-                <span class="tripo-model-current-l">
-                    <span class="tripo-model-kicker">${escapeHtml(tl('smart.tripoModel', '模型'))}</span>
-                    <span class="tripo-model-current-name">${escapeHtml(model ? model.name : modelId)}</span>
-                </span>
-                <span class="tripo-model-current-r">
-                    ${model && model.recommended ? `<i class="tripo-model-star">${escapeHtml(tl('smart.tripoRecommended', '推荐'))}</i>` : ''}
-                    <i data-lucide="${node.tripoModelPanelOpen ? 'chevron-up' : 'chevron-down'}" class="w-4 h-4"></i>
-                </span>
-            </button>
-            ${node.tripoModelPanelOpen ? `<div class="tripo-model-list">${modelItems}
-                <div class="tripo-model-note">${escapeHtml(tl('smart.tripoModelNote', '四视图不支持 P1（已在列表中隐藏）'))}</div>
-            </div>` : ''}
-        </div>
-
+        <div class="tripo-options-section"><div class="tripo-section-label">通用设置</div>
+        <details class="tripo-options" ${smartTripoOptionsOpen.has(node.id) ? 'open' : ''}>
+        <summary><span>几何与纹理</span><i data-lucide="chevron-down"></i></summary>
         <div class="tripo-settings">
             <div class="tripo-settings-row">
                 <label class="tripo-field">
@@ -6370,9 +6389,9 @@ function smartTripoBodyHtml(node){
             <div class="tripo-settings-row">
                 <label class="tripo-field">
                     <span class="tripo-field-label">${escapeHtml(tl('canvas.tripoFaceLimit', '面数上限'))}</span>
-                    <input class="tripo-face-input" type="number" min="1000" step="1000" value="${escapeHtml(node.tripoFaceLimit || '')}" placeholder="${escapeHtml(tl('smart.tripoAuto', '自动'))}">
+                    <input class="tripo-face-input" type="number" min="1000" step="1000" value="${escapeHtml(node.tripoFaceLimit || '')}" placeholder="${escapeHtml(modelId === 'P2-20260801' ? '自动 · 上限 5 万' : tl('smart.tripoAuto', '自动'))}">
                 </label>
-                ${cap('parts') ? `<label class="tripo-check tripo-check-wide"><input type="checkbox" data-tripo-check="tripoGenerateParts" ${node.tripoGenerateParts ? 'checked' : ''}><span>${escapeHtml(tl('smart.tripoParts', '自动分件'))}</span></label>` : ''}
+                ${cap('generateParts') ? `<label class="tripo-check tripo-check-wide"><input type="checkbox" data-tripo-check="tripoGenerateParts" ${node.tripoGenerateParts ? 'checked' : ''}><span>${escapeHtml(tl('smart.tripoParts', '自动分件'))}</span></label>` : ''}
                 ${cap('smartLowPoly') ? `<label class="tripo-check tripo-check-wide"><input type="checkbox" data-tripo-check="tripoSmartLowPoly" ${node.tripoSmartLowPoly ? 'checked' : ''}><span>${escapeHtml(tl('canvas.tripoSmartLowPoly', '智能低模'))}</span></label>` : ''}
             </div>
             <div class="tripo-settings-row tripo-checks">
@@ -6384,9 +6403,10 @@ function smartTripoBodyHtml(node){
             </div>
         </div>
 
-        ${est ? `<div class="tripo-estimate">
+        </details></div>
+        ${est ? `<div class="tripo-estimate" title="${escapeHtml(est.parts.map(p => `${p.label} ${p.text}`).join(' · '))}">
             <i data-lucide="coins" class="w-3.5 h-3.5"></i>
-            <span>${escapeHtml(tl('smart.tripoEstimate', '预计'))} <b>${est.min}–${est.max}</b> ${escapeHtml(tl('smart.tripoCredits', '点'))}</span>
+            <span>${escapeHtml(tl('smart.tripoEstimate', '预计'))} <b>${est.min === est.max ? est.min : `${est.min}–${est.max}`}</b> ${escapeHtml(tl('smart.tripoCredits', '点'))}</span>
             <span class="tripo-estimate-detail">${escapeHtml(est.parts.map(p => `${p.label} ${p.text}`).join(' · '))}</span>
         </div>` : ''}
 
@@ -6406,9 +6426,8 @@ function smartTripoBodyHtml(node){
         ${node.tripoError ? `<div class="tripo-error">${escapeHtml(node.tripoError)}</div>` : ''}
         ${result ? `
         <div class="tripo-result">
-            <div class="tripo-viewer" data-tripo-viewer-stage="1" data-tripo-viewer-url="${escapeHtml(result.model || '')}"></div>
             ${history.length > 1 ? `<div class="tripo-history">
-                ${history.map((h, i) => `<button type="button" class="tripo-history-item ${node.tripoResult === h ? 'active' : ''}" data-tripo-history="${i}" title="${escapeHtml(h.taskId || '')}">
+                ${history.map((h, i) => `<button type="button" class="tripo-history-item ${node.tripoResult?.taskId === h.taskId ? 'active' : ''}" data-tripo-history="${i}" title="${escapeHtml(h.taskId || '')}">
                     ${h.preview ? `<img src="${escapeHtml(h.preview)}" alt="" draggable="false">` : `<i data-lucide="box" class="w-4 h-4"></i>`}
                 </button>`).join('')}
             </div>` : ''}
@@ -6424,17 +6443,125 @@ function smartTripoBodyHtml(node){
         </div>` : ''}
     </div>`;
 }
+function closeSmartTripoModelList(){
+    const node = nodes.find(n => n.id === smartTripoPanelNodeId);
+    if(node) node.tripoModelPanelOpen = false;
+    smartTripoPanel?.querySelector('.tripo-model-popover')?.remove();
+    const toggle = smartTripoPanel?.querySelector('[data-tripo-model-toggle]');
+    toggle?.classList.remove('open');
+    toggle?.setAttribute('aria-expanded', 'false');
+}
+function positionSmartTripoPanel(){
+    if(!smartTripoPanel || smartTripoPanel.hidden) return;
+    const anchor = world.querySelector(`.tripo-smart-node[data-id="${CSS.escape(smartTripoPanelNodeId)}"]`);
+    if(!anchor){ smartTripoPanel.hidden = true; return; }
+    const r = anchor.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const width = Math.min(350, Math.max(0, vw - 24));
+    const minTop = vh < 600 ? 12 : 84;
+    const top = Math.max(minTop, Math.min(r.top, Math.max(minTop, vh - 800)));
+    let left = r.right + 18;
+    if(left + width > vw - 12) left = r.left - width - 18 >= 12 ? r.left - width - 18 : vw - width - 12;
+    smartTripoPanel.style.width = `${width}px`;
+    smartTripoPanel.style.left = `${Math.max(12, left)}px`;
+    smartTripoPanel.style.top = `${top}px`;
+    smartTripoPanel.style.maxHeight = `${Math.max(120, vh - top - 16)}px`;
+    const list = smartTripoPanel.querySelector('.tripo-model-popover');
+    if(!list) return;
+    const trigger = smartTripoPanel.querySelector('[data-tripo-model-toggle]').getBoundingClientRect();
+    const pr = smartTripoPanel.getBoundingClientRect();
+    const listWidth = Math.min(390, vw - 24);
+    let listLeft = pr.right + 10;
+    if(listLeft + listWidth > vw - 12) listLeft = pr.left - listWidth - 10 >= 12 ? pr.left - listWidth - 10 : Math.max(12, Math.min(pr.left, vw - listWidth - 12));
+    list.style.width = `${listWidth}px`;
+    list.style.left = `${listLeft}px`;
+    list.style.top = `${Math.max(12, Math.min(trigger.top, vh - 280))}px`;
+    list.style.maxHeight = `${Math.max(120, vh - parseFloat(list.style.top) - 16)}px`;
+}
+function syncSmartTripoPanel(force=false){
+    const ids = selectedNodeIds();
+    const node = ids.length === 1 ? nodes.find(n => n.id === ids[0] && n.type === 'smart-tripo') : null;
+    if(!node || node.id !== smartTripoPanelNodeId){
+        closeSmartTripoModelList();
+        smartTripoPanelDismissedId = '';
+    }
+    if(!node || node.id === smartTripoPanelDismissedId){
+        if(smartTripoPanel) smartTripoPanel.hidden = true;
+        smartTripoPanelNodeId = node?.id || '';
+        return;
+    }
+    if(!smartTripoPanel){
+        smartTripoPanel = document.createElement('aside');
+        smartTripoPanel.className = 'smart-tripo-panel';
+        smartTripoPanel.setAttribute('aria-label', '模型生成设置');
+        shell.appendChild(smartTripoPanel);
+        ['pointerdown','mousedown','click','dblclick','wheel','contextmenu'].forEach(type => smartTripoPanel.addEventListener(type, e => e.stopPropagation()));
+        smartTripoPanel.addEventListener('keydown', e => {
+            e.stopPropagation();
+            if(e.key !== 'Escape') return;
+            e.preventDefault();
+            if(smartTripoPanel.querySelector('.tripo-model-popover')){
+                closeSmartTripoModelList();
+                smartTripoPanel.querySelector('[data-tripo-model-toggle]')?.focus();
+            } else {
+                smartTripoPanelDismissedId = smartTripoPanelNodeId;
+                smartTripoPanel.hidden = true;
+            }
+        });
+        document.addEventListener('pointerdown', e => { if(!smartTripoPanel.contains(e.target)) closeSmartTripoModelList(); }, true);
+        document.addEventListener('keydown', e => {
+            if(e.key === 'Escape' && !smartTripoPanel.hidden){
+                e.preventDefault(); e.stopImmediatePropagation();
+                if(smartTripoPanel.querySelector('.tripo-model-popover')) closeSmartTripoModelList();
+                else { smartTripoPanelDismissedId = smartTripoPanelNodeId; smartTripoPanel.hidden = true; }
+            }
+        }, true);
+        window.addEventListener('resize', positionSmartTripoPanel);
+    }
+    const changed = smartTripoPanelNodeId !== node.id;
+    smartTripoPanelNodeId = node.id;
+    smartTripoPanel.hidden = false;
+    if(changed || force || !smartTripoPanel.firstElementChild){
+        const scrollTop = changed ? 0 : (smartTripoPanel.querySelector('.tripo-panel-scroll')?.scrollTop || 0);
+        smartTripoPanel.innerHTML = `<header class="tripo-panel-head"><h2><i data-lucide="box"></i>生成 3D 模型</h2><button type="button" class="tripo-panel-close" title="关闭设置" aria-label="关闭模型设置"><i data-lucide="x"></i></button></header><div class="tripo-panel-scroll">${smartTripoPanelHtml(node)}</div><footer class="tripo-panel-footer"></footer>`;
+        const footer = smartTripoPanel.querySelector('.tripo-panel-footer');
+        smartTripoPanel.querySelectorAll('.smart-tripo-body > .tripo-estimate, .smart-tripo-body > .tripo-run-row, .smart-tripo-body > .tripo-progress, .smart-tripo-body > .tripo-error').forEach(el => footer.appendChild(el));
+        const list = smartTripoPanel.querySelector('.tripo-model-popover');
+        if(list) smartTripoPanel.appendChild(list);
+        smartTripoPanel.querySelector('.tripo-panel-close').onclick = () => {
+            closeSmartTripoModelList();
+            smartTripoPanelDismissedId = node.id;
+            smartTripoPanel.hidden = true;
+        };
+        const options = smartTripoPanel.querySelector('.tripo-options');
+        options.ontoggle = () => {
+            if(!options.isConnected) return;
+            if(options.open) smartTripoOptionsOpen.add(node.id); else smartTripoOptionsOpen.delete(node.id);
+            positionSmartTripoPanel();
+        };
+        const scroll = smartTripoPanel.querySelector('.tripo-panel-scroll');
+        scroll.scrollTop = scrollTop;
+        scroll.addEventListener('scroll', positionSmartTripoPanel, {passive:true});
+        bindTripoNodeControls(smartTripoPanel, node);
+        window.lucide?.createIcons({root:smartTripoPanel});
+    }
+    positionSmartTripoPanel();
+}
 function smartTripoUpdateProgressDom(node){
-    const el = world.querySelector(`.image-node[data-id="${node.id}"]`);
-    if(!el) return;
-    const fill = el.querySelector('.tripo-progress-fill');
-    const label = el.querySelector('.tripo-progress-label');
+    const roots = [world.querySelector(`.image-node[data-id="${CSS.escape(node.id)}"]`)];
+    if(smartTripoPanelNodeId === node.id) roots.push(smartTripoPanel);
     const pct = Math.max(0, Math.min(100, Number(node.tripoProgress || 0)));
-    if(fill) fill.style.width = `${pct}%`;
-    if(label) label.textContent = `${node.tripoTaskStatus === 'queued' ? '排队中' : '生成中'} ${pct}%`;
+    roots.filter(Boolean).forEach(el => {
+        const fill = el.querySelector('.tripo-progress-fill');
+        const label = el.querySelector('.tripo-progress-label');
+        if(fill) fill.style.width = `${pct}%`;
+        if(label) label.textContent = `${node.tripoTaskStatus === 'queued' ? '排队中' : '生成中'} ${pct}%`;
+    });
 }
 async function smartTripoUploadSlot(node, slot, file){
     if(!file) return;
+    if(!SMART_TRIPO_SLOTS.some(s => s.key === slot)) throw new Error('不支持的视图');
+    if(!/\.(png|jpe?g|webp)$/i.test(file.name || '')) throw new Error('请上传 JPG、PNG 或 WEBP 图片');
     const form = new FormData();
     form.append('files', file, file.name || `${slot}.png`);
     const data = await fetch('/api/ai/upload', {method:'POST', body:form}).then(r => r.json());
@@ -6624,12 +6751,30 @@ function resumeSmartTripoTasks(){
 function bindTripoNodeControls(el, node){
     const T = window.TripoUI || {};
     const save = () => scheduleSave();
+    const open = el.querySelector('[data-tripo-open]');
+    if(open) open.onclick = e => {
+        e.stopPropagation();
+        selectedId = node.id; selectedIds = []; selectedImage = {nodeId:'', index:-1};
+        smartTripoPanelDismissedId = '';
+        syncSelectionUi();
+        syncSmartTripoPanel(true);
+    };
+    el.querySelectorAll('.tripo-slot').forEach(slot => {
+        slot.ondragover = e => { e.preventDefault(); e.stopPropagation(); slot.classList.add('drag-over'); };
+        slot.ondragleave = () => slot.classList.remove('drag-over');
+        slot.ondrop = e => {
+            e.preventDefault(); e.stopPropagation(); slot.classList.remove('drag-over');
+            const file = e.dataTransfer?.files?.[0];
+            if(file) smartTripoUploadSlot(node, slot.dataset.slot, file).catch(err => toast(err.message || String(err)));
+        };
+    });
     el.querySelectorAll('[data-tripo-mode]').forEach(btn => {
         btn.onclick = e => {
             e.stopPropagation();
             const next = btn.dataset.tripoMode;
             if(node.tripoMode === next) return;
             node.tripoMode = next;
+            node.tripoModelPanelOpen = false;
             /* 模式切换后，若当前模型在新模式下不可用（如 P1 → 四视图），自动回落到该模式默认模型 */
             if(T.resolveModelForMode) node.tripoModelVersion = T.resolveModelForMode(node.tripoModelVersion, next);
             render();
@@ -6644,9 +6789,10 @@ function bindTripoNodeControls(el, node){
         if(!urls.length){ toast(tr('smart.tripoNoUpstream') || '没有可用的连线图片'); return; }
         node.tripoViews = node.tripoViews || {};
         if((node.tripoMode || 'multiview') === 'image'){
-            node.tripoViews.front = urls[0];
+            if(!node.tripoViews.front) node.tripoViews.front = urls[0];
         } else {
-            ['front','back','left','right'].forEach((k, i) => { if(urls[i]) node.tripoViews[k] = urls[i]; });
+            let index = 0;
+            ['front','back','left','right'].forEach(k => { if(!node.tripoViews[k] && urls[index]) node.tripoViews[k] = urls[index++]; });
         }
         render();
         save();
@@ -6657,7 +6803,7 @@ function bindTripoNodeControls(el, node){
             const slot = btn.dataset.tripoUpload;
             const input = document.createElement('input');
             input.type = 'file';
-            input.accept = 'image/*';
+            input.accept = '.jpg,.jpeg,.png,.webp';
             input.onchange = () => {
                 const file = input.files?.[0];
                 if(file) smartTripoUploadSlot(node, slot, file).catch(err => toast(err.message || String(err)));
@@ -6744,6 +6890,10 @@ function bindTripoNodeControls(el, node){
         };
     });
     const stage = el.querySelector('[data-tripo-viewer-stage]');
+    if(stage && !stage.dataset.tripoEventsBound){
+        stage.dataset.tripoEventsBound = '1';
+        ['pointerdown','mousedown','wheel','dblclick'].forEach(type => stage.addEventListener(type, e => e.stopPropagation()));
+    }
     if(stage && node.tripoResult?.model && !stage.querySelector('canvas') && !stage.querySelector('.tripo-viewer-loading')){
         window.TripoUI?.mountViewer(stage, node.tripoResult.model);
     }
@@ -7053,6 +7203,7 @@ function moveNodeElementsDuringDrag(){
         positionComposerForNode(active);
     }
     scheduleInteractionLayerRefresh();
+    positionSmartTripoPanel();
 }
 function updateNodeElementDuringResize(node){
     if(!node) return;
@@ -7065,6 +7216,7 @@ function updateNodeElementDuringResize(node){
     const layout = imageLayout(imgs, nodeScale(node), node);
     el.style.width = `${layout.width}px`;
     el.style.height = `${layout.height}px`;
+    positionSmartTripoPanel();
     const body = el.querySelector('.node-body');
     if(body){
         const loadingSingle = body.querySelector('.loading-cell.single');
@@ -9012,7 +9164,7 @@ function render(){
         const body = nodeBodyHtml(node, layout);
         const deleteBtn = (isGroup || isMinimax) ? '' : `<button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button>`;
         const hint = isSmartGroup ? '双击添加 · 拖入归组 · 选中后生成' : isMinimax ? 'Timeline editing' : isTripo ? '图片/提示词连线输入 · 或节点内上传' : isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
-        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isMinimax ? 'minimax-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isCompactMember ? 'smart-group-member-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
+        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isMinimax ? 'minimax-smart-node' : ''} ${isTripo ? 'tripo-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isCompactMember ? 'smart-group-member-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
 
             <div class="node-head"><div class="node-title">${title}</div><div class="node-actions">${deleteBtn}</div></div>
             ${!isEmpty && !isGroup && !isMinimax ? `<div class="floating-node-actions"><button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button></div>` : ''}
@@ -9064,6 +9216,7 @@ function render(){
     syncSmartSelectedImageResolution(world);
     measureSmartNodeImages();
     refreshRunTimerPills();
+    syncSmartTripoPanel(true);
     return;
     world.innerHTML = '';
     if(composerEl) world.appendChild(composerEl);
@@ -10238,6 +10391,7 @@ function bindNodeEvents(){
             e.stopPropagation();
             if(Date.now() < suppressNodeClickUntil) return;
             const node = nodes.find(n => n.id === id);
+            if(node?.type === 'smart-tripo') smartTripoPanelDismissedId = '';
             hideRunTimerForNode(node);
             const alreadySelected = selectedId === id && selectedIds.length === 0 && selectedImage.nodeId === '';
             selectedId = id;
@@ -10476,6 +10630,7 @@ function bindNodeEvents(){
             if(!node) return;
             const rect = nodeRect(node);
             resizeState = {id, startX:e.clientX, startY:e.clientY, startW:rect.width, startH:rect.height};
+            if(node.type === 'smart-tripo') resizeState.lockRatio = 1;
             // 单张图片/视频节点：锁定画框纵横比，使框始终贴合媒体比例，避免 object-fit:cover 裁掉画面。
             // 取媒体原始宽高比；拿不到尺寸（如音频卡片）则不锁，保持自由缩放。
             if(isSmartImageNode(node) && (node.images || []).length === 1 && !isAudioMediaItem(node.images[0])){
@@ -10503,7 +10658,7 @@ function bindNodeEvents(){
             capturePendingUndo();
         });
         const beginNodeDrag = e => {
-            if(e.button !== 0 || e.target.closest('.mini-x, .smart-node-floating-menu, .node-resize-handle, .thumb-item, .node-port, .prompt-node-control, select, input, textarea, button')) return;
+            if(e.button !== 0 || e.target.closest('.mini-x, .smart-node-floating-menu, .node-resize-handle, .thumb-item, .node-port, .prompt-node-control, .tripo-viewer, select, input, textarea, button')) return;
             if(e.target.closest('.prompt-node-pill, textarea:not(.prompt-node-text)')) return;
             e.preventDefault(); e.stopPropagation();
             window.getSelection?.()?.removeAllRanges?.();

@@ -15,6 +15,9 @@ const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;'
  *   generateParts→ 自动分件
  *   geoQuality  → geometry_quality（Ultra 超清几何）
  *   multiview   → 四视图输入（注意：P1 不支持，UI 必须按模式过滤）
+ *
+ * 模型阵容（2026-09 起，H3.0 / H2.5 已按用户要求下架）：
+ *   H3.1 = 高精度旗舰（Ultra 200 万面）；P2.0 = 游戏就绪网格（预览，四边面 Quad，最高 5 万面）；P1.0 = 极速原型（约 2 秒出网格）。
  */
 const CAP = {QUAD:'quad', LOWPOLY:'smartLowPoly', PARTS:'generateParts', GEO:'geoQuality', MV:'multiview'};
 
@@ -29,20 +32,12 @@ const MODELS = [
         recommended:true
     },
     {
-        id:'v3.0-20250812',
-        name:'Tripo H3.0',
-        tag:'稳定 · 高级功能',
-        desc:'边缘更锐利、表面更干净，支持 Ultra 超清几何',
+        id:'P2-20260801',
+        name:'Tripo P2.0',
+        tag:'预览 · 四边面拓扑',
+        desc:'游戏就绪网格：原生四边面（Quad）拓扑，最高 5 万面，适合直接绑定与进引擎',
         modes:['text','image','multiview'],
-        caps:[CAP.QUAD, CAP.LOWPOLY, CAP.PARTS, CAP.GEO]
-    },
-    {
-        id:'v2.5-20250123',
-        name:'Tripo H2.5',
-        tag:'均衡 · 兼容旧工作流',
-        desc:'经典均衡版本；用 v2.5 生成的模型建议配 v2.5 贴图',
-        modes:['text','image','multiview'],
-        caps:[CAP.QUAD, CAP.LOWPOLY, CAP.PARTS]
+        caps:[CAP.QUAD]
     },
     {
         id:'P1-20260311',
@@ -73,6 +68,8 @@ const TEXTURE_MODEL_VERSIONS = [
 
 /* 官方定价（developers.tripo3d.ai）：基础任务为区间价，贴图档位为固定加价 */
 const BASE_CREDITS = {text:[10,20], image:[20,30], multiview:[20,30]};
+/* P2（P2-20260801，预览）单独固定价：基础 100 点，贴图档位仍为 +10/+20/+30（官方 2026-08 changelog） */
+const P2_BASE_CREDITS = 100;
 const POST_CREDITS = {texture:5, convert:5, refine:5};
 
 const MODE_LABELS = {text:'文生 3D', image:'单图生 3D', multiview:'四视图生 3D'};
@@ -98,7 +95,18 @@ function resolveModelForMode(modelId, mode){
     return defaultModelForMode(mode);
 }
 /* 点数估算：返回 {min,max,parts[]}，parts 用于向用户逐项说明构成 */
-function estimateCredits({mode='image', texture=true, textureQuality='standard'}={}){
+function estimateCredits({mode='image', texture=true, textureQuality='standard', modelId=''}={}){
+    /* P2 预览版不按 H/P 系列的区间价计费，改为固定价，避免显示 20–30 点却实际扣 100+ */
+    if(modelId === 'P2-20260801'){
+        const parts = [{label:'P2 生成', text:`${P2_BASE_CREDITS} 点`}];
+        let p2min = P2_BASE_CREDITS, p2max = P2_BASE_CREDITS;
+        if(texture !== false){
+            const q = TEXTURE_QUALITIES.find(x => x.id === textureQuality) || TEXTURE_QUALITIES[0];
+            p2min += q.credits; p2max += q.credits;
+            parts.push({label:`${q.label}加价`, text:`+${q.credits} 点`});
+        }
+        return {min:p2min, max:p2max, parts};
+    }
     const base = BASE_CREDITS[mode] || BASE_CREDITS.image;
     const parts = [{label:MODE_LABELS[mode] || '生成', text:`${base[0]}–${base[1]} 点`}];
     let min = base[0], max = base[1];

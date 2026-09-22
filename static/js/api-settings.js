@@ -3327,6 +3327,7 @@ function renderModelPicker(){
     const filter = (document.getElementById('pickerFilter')?.value || '').toLowerCase();
     const currentTab = document.querySelector('.picker-cat-tab.active')?.dataset.cat || 'all';
     const ids = Object.keys(pickerState.category).sort();
+    const upstreamSet = new Set(lastFetchedAll);  // 本次从上游实际拉取到的模型 id
     // 各分类总数 / 已选数
     const totals = { all: ids.length, image:0, chat:0, video:0 };
     const selecteds = { all:0, image:0, chat:0, video:0 };
@@ -3343,7 +3344,7 @@ function renderModelPicker(){
         return pickerState.category[id] === currentTab;
     });
     pickerVisibleIds = list;
-    document.getElementById('pickerCount').textContent = `共 ${totals.all} 个模型 · 当前显示 ${list.length} 个`;
+    document.getElementById('pickerCount').textContent = `共 ${totals.all} 个模型 · 上游 ${upstreamSet.size} 个 · 当前显示 ${list.length} 个`;
     document.querySelectorAll('.picker-cat-tab').forEach(tab => {
         const cat = tab.dataset.cat;
         tab.querySelector('.cat-count').textContent = `${selecteds[cat]}/${totals[cat]}`;
@@ -3353,6 +3354,7 @@ function renderModelPicker(){
         const checked = pickerState.selected[id];
         const label = modelDisplayName(id, item);
         const badge = providerModelBadge(id, label);
+        const upstreamMissing = !upstreamSet.has(id);  // 仅存在于本地配置、上游当前未提供
         return `
             <div class="picker-row ${checked?'has-sel':''}" onclick="togglePickerRowByIndex(${index})">
                 <div class="picker-checkbox ${checked?'checked':''}">
@@ -3362,6 +3364,7 @@ function renderModelPicker(){
                 <div class="picker-model-name" title="${escapeAttr(id)}">
                     <div class="picker-model-label">${escapeHtml(label || id)}</div>
                     ${label && label !== id ? `<div class="picker-model-id">${escapeHtml(id)}</div>` : ''}
+                    ${upstreamMissing ? `<div class="picker-model-id">上游未提供 · 仅本地配置</div>` : ''}
                 </div>
             </div>
         `;
@@ -3747,7 +3750,9 @@ async function loadProviders(){
         providers = data.providers || [];
         selectedId = sortedProviders()[0]?.id || '';
         renderEditor();
-        openRecommendApi();
+        // 默认展示平台配置编辑器（能直接看到/修改自己的配置）；
+        // 仅当没有任何平台时，才进入「推荐 API」引导视图。推荐页仍可通过左下角按钮随时打开。
+        if(!providers.length) openRecommendApi();
         setStatus('');
     } catch(err) {
         setStatus(tr('api.loadFailed'));

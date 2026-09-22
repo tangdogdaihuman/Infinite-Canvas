@@ -16,12 +16,12 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.04.1786152769"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.08.04.1786152769"></script>
-    <script src="/static/js/theme.js?v=2026.08.04.1786152769"></script>
-    <script src="/static/js/i18n.js?v=2026.08.04.1786152769"></script>
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.04.1786152769">
-    <link rel="stylesheet" href="/static/css/api-settings.css?v=2026.08.04.1786152769">
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.04.1786152768"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.08.04.1786152768"></script>
+    <script src="/static/js/theme.js?v=2026.08.04.1786152768"></script>
+    <script src="/static/js/i18n.js?v=2026.08.04.1786152768"></script>
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.04.1786152768">
+    <link rel="stylesheet" href="/static/css/api-settings.css?v=2026.08.04.1786152768">
 </head>
 <body>
     <div class="page">
@@ -390,6 +390,9 @@
                             <div class="editor-title" data-i18n="api.recommendPanelTitle">推荐平台</div>
                             <div class="editor-sub" data-i18n="api.recommendPanelSub">获取 Key 后保存，右侧会切换到刚保存的平台配置。</div>
                         </div>
+                        <div class="content-actions">
+                            <button class="action-btn" type="button" onclick="closeRecommendApi()"><i data-lucide="arrow-left" class="w-3.5 h-3.5"></i><span data-i18n="api.backToProviders">返回平台配置</span></button>
+                        </div>
                     </div>
                     <section id="recommendPanel" class="provider-onboarding-card recommend-inline-card"></section>
                 </main>
@@ -416,7 +419,7 @@
         <div class="picker-modal">
             <div class="picker-head">
                 <div>
-                    <div class="picker-title">从上游拉取的模型清单</div>
+                    <div class="picker-title">模型清单</div>
                     <div id="pickerCount" class="picker-count">—</div>
                 </div>
                 <div class="picker-close" onclick="closeModelPicker()"><i data-lucide="x" class="w-4 h-4"></i></div>
@@ -566,6 +569,6 @@
         </div>
     </div>
 
-    <script src="/static/js/api-settings.js?v=2026.08.04.1786329455"></script>
+    <script src="/static/js/api-settings.js?v=2026.08.04.1789108166"></script>
 </body>
 </html>
