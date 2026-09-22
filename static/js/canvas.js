@@ -3537,6 +3537,10 @@ function renderTripoBody(node){
             <textarea class="setting-input tripo-prompt-input" rows="3" placeholder="${escapeAttr(tr('canvas.tripoPromptPlaceholder'))}">${escapeHtml(node.tripoPrompt || '')}</textarea>
             ` : ''}
         </div>
+        <details class="tripo-imgassist">
+            <summary><span>${escapeHtml(tl('smart.tripoImgAssist', '生图辅助'))} · ${escapeHtml(tl('smart.tripoImgAssistSummary', '概念图 / 四视图'))}</span></summary>
+            <div class="tripo-imgassist-mount" data-tripo-imgassist="1"></div>
+        </details>
         <div class="ms-controls">
             <div class="gen-settings">
                 <div class="tripo-model-picker">
@@ -3614,9 +3618,8 @@ function renderTripoBody(node){
                     </button>`).join('')}
                 </div>` : ''}
                 <div class="tripo-result-actions">
-                    ${result.model ? `<a class="secondary-btn tripo-download-btn" href="${escapeAttr(result.model)}" download title="${escapeAttr(result.model)}"><i data-lucide="download" class="w-3.5 h-3.5"></i><span>GLB</span></a>` : ''}
+                    ${result.model ? `<a class="secondary-btn tripo-download-btn" href="${escapeAttr(result.model)}" download title="${escapeAttr(result.model)}"><i data-lucide="download" class="w-3.5 h-3.5"></i><span>${escapeHtml(window.TripoUI?.modelFormatLabel?.(result.model) || 'GLB')}</span></a>` : ''}
                     <button type="button" class="secondary-btn tripo-retexture-btn" ${node.running ? 'disabled' : ''}><i data-lucide="palette" class="w-3.5 h-3.5"></i><span>${tr('canvas.tripoRetexture')}</span></button>
-                    <button type="button" class="secondary-btn tripo-refine-btn" ${node.running ? 'disabled' : ''} title="${escapeAttr(tl('smart.tripoRefineHint', '把草模精修成高精度模型'))}"><i data-lucide="sparkles" class="w-3.5 h-3.5"></i><span>${escapeHtml(tl('smart.tripoRefine', '精修'))}</span></button>
                     <span class="tripo-convert-group">
                         <select class="select-lite tripo-convert-format">
                             <option value="GLB">GLB</option><option value="FBX">FBX</option><option value="OBJ">OBJ</option><option value="USDZ">USDZ</option><option value="STL">STL</option>
@@ -3624,6 +3627,7 @@ function renderTripoBody(node){
                         <button type="button" class="secondary-btn tripo-convert-btn" ${node.running ? 'disabled' : ''}><i data-lucide="repeat" class="w-3.5 h-3.5"></i><span>${tr('canvas.tripoConvert')}</span></button>
                     </span>
                 </div>
+                <div class="tripo-caps-mount"></div>
             </div>` : ''}
         </div>
     `;
@@ -3721,8 +3725,6 @@ function renderTripoBody(node){
     };
     const retextureBtn = wrap.querySelector('.tripo-retexture-btn');
     if(retextureBtn) retextureBtn.onclick = e => { e.stopPropagation(); runTripoPostProcess(node.id, 'texture_model'); };
-    const refineBtn = wrap.querySelector('.tripo-refine-btn');
-    if(refineBtn) refineBtn.onclick = e => { e.stopPropagation(); runTripoPostProcess(node.id, 'refine_model'); };
     const convertBtn = wrap.querySelector('.tripo-convert-btn');
     if(convertBtn) convertBtn.onclick = e => {
         e.stopPropagation();
@@ -3747,6 +3749,65 @@ function renderTripoBody(node){
             const container = nodesEl.querySelector(`.node[data-id="${node.id}"] .tripo-viewer`);
             if(container) window.TripoUI?.mountViewer(container, result.model);
         }, 60);
+    }
+    /* 双击节点 → 放大预览（贴图/统计/线框/白膜/尺寸）；避开按钮等交互元素 */
+    wrap.addEventListener('dblclick', e => {
+        if(e.target.closest('button,a,select,input,[data-tripo-history],.tripo-slot')) return;
+        const model = node.tripoResult?.model;
+        if(!model) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const T = window.TripoUI || {};
+        const id = T.resolveModelForMode ? T.resolveModelForMode(node.tripoModelVersion, node.tripoMode || 'multiview') : node.tripoModelVersion;
+        const name = (T.modelById ? T.modelById(id)?.name : '') || '3D 模型';
+        window.TripoPreviewModal?.toggle({url:model, name});
+    });
+    /* 能力卡（减面 / 导出参数…）：元数据驱动，见 static/js/tripo/capability-actions.js */
+    const capsMount = wrap.querySelector('.tripo-caps-mount');
+    if(capsMount){
+        window.TripoActions?.mount(capsMount, {
+            node,
+            taskId: () => node.tripoResult?.taskId || node.tripoTaskId || '',
+            refresh(){ refreshNodes([node.id]); scheduleSave(); },
+            onResult(capId, result){
+                node.tripoResult = result;
+                pushTripoHistory(node, result);
+            },
+            onDownload(capId, result){
+                if(!result?.model) return;
+                const a = document.createElement('a');
+                a.href = result.model;
+                a.download = result.name || '';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+            },
+        });
+    }
+    /* 生图辅助（image 组）：输入取视图槽位/连线图片，产物经 addImageNode 落成图片节点 */
+    const imgassistMount = wrap.querySelector('[data-tripo-imgassist]');
+    if(imgassistMount){
+        window.TripoActions?.mount(imgassistMount, {
+            node,
+            refresh(){ refreshNodes([node.id]); scheduleSave(); },
+            inputImage(){
+                const views = node.tripoViews || {};
+                const linked = imageRefsOnly(orderedSources(node, generatorSources(node)).flatMap(s => s.refs || []))[0];
+                return views.front || views.back || views.left || views.right || linked?.url || '';
+            },
+            onImageResult(capId, result){
+                const imgNode = addImageNode({x:Number(node.x || 0) + 240, y:Number(node.y || 0)});
+                if(imgNode){
+                    imgNode.url = result.image;
+                    imgNode.name = result.name || '生图辅助';
+                    imgNode.mediaKind = 'image';
+                    selected.clear();
+                    selected.add(imgNode.id);
+                    render();
+                    scheduleSave();
+                }
+            },
+        }, {ids:['image_to_multiview', 'image_to_image']});
     }
     return wrap;
 }
@@ -16739,6 +16800,37 @@ function hasOutputImageDrag(dataTransfer){ return [...(dataTransfer?.types || []
 function escapeHtml(str){ return String(str == null ? '' : str).replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s])); }
 function escapeAttr(str){ return escapeHtml(str); }
 
+/* 经典画布 WS（/ws/stats）：与智能画布同款 connect/retry 模式。
+ * tripo_task 进度经 CustomEvent('tripo-task-progress') 广播给能力卡与任务中心；断线 3s 重连。 */
+let tripoStatsSocketTimer = null;
+function connectTripoStatsSocket(){
+    const host = window.location.host;
+    if(!host) return;
+    const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+    let socket;
+    const connect = () => {
+        try {
+            socket = new WebSocket(`${protocol}://${host}/ws/stats?client_id=classic-canvas-${Date.now()}`);
+        } catch(e){
+            tripoStatsSocketTimer = setTimeout(connect, 3000);
+            return;
+        }
+        socket.onmessage = event => {
+            try {
+                const data = JSON.parse(event.data);
+                if(data?.type === 'tripo_task') window.dispatchEvent(new CustomEvent('tripo-task-progress', {detail:data}));
+            } catch(e){}
+        };
+        socket.onclose = () => { tripoStatsSocketTimer = setTimeout(connect, 3000); };
+        socket.onerror = () => { try { socket.close(); } catch(e){} };
+    };
+    window.addEventListener('beforeunload', () => {
+        clearTimeout(tripoStatsSocketTimer);
+        try { socket?.close(); } catch(e){}
+    });
+    connect();
+}
+
 window.onload = async () => {
     applyTheme(localStorage.getItem('studio_theme') || localStorage.getItem(CANVAS_THEME_KEY) || 'light');
     applyQuickToolbarState();
@@ -16749,6 +16841,9 @@ window.onload = async () => {
     applyViewport();
     await loadConfig();
     if(window.TripoUI) TripoUI.mountBalance(document.getElementById('tripoBalance'));
+    /* Tripo：/ws/stats 进度广播（能力卡进度平滑）+ 任务中心（共享组件，与智能画布同款） */
+    connectTripoStatsSocket();
+    window.TripoTaskCenter?.init({button:'#tripoTasksClassic'});
     pruneMissingComfyWorkflows();
     // 编辑器页只负责打开单个画布：必须带 ?id；没有 id 就回到独立的选画布页面。
     const openId = new URLSearchParams(window.location.search).get('id');

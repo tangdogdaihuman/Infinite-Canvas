@@ -1586,7 +1586,25 @@ input[type=range].smart-range::-webkit-slider-thumb { -webkit-appearance:none; w
 .tripo-balance-error{ color:#f59e0b !important; }
 .tripo-spin{ animation:tripo-rotate 1s linear infinite; }
 @keyframes tripo-rotate{ from{ transform:rotate(0deg); } to{ transform:rotate(360deg); } }
+/* ===== Tripo 任务中心按钮（抽屉/徽章样式由 static/js/tripo/task-center.js 内注）===== */
+.tripo-tasks-smart{ position:absolute; right:562px; top:22px; z-index:56; height:40px; padding:0 14px; border-radius:999px; background:var(--panel); color:var(--text); border:1px solid var(--line); box-shadow:0 14px 34px var(--shadow); backdrop-filter:blur(16px); display:flex; align-items:center; justify-content:center; gap:6px; font-size:11px; font-weight:800; white-space:nowrap; cursor:pointer; }
+.tripo-tasks-smart:hover{ border-color:var(--text); transform:translateY(-1px); }
+.tripo-tasks-smart.active{ background:var(--strong); color:var(--strong-text); border-color:var(--strong); }
+.tripo-tasks-smart i,.tripo-tasks-smart svg{ width:14px; height:14px; }
+@media (max-width: 900px){
+    .tripo-tasks-smart{ right:254px; width:40px; padding:0; }
+    .tripo-tasks-smart span{ display:none; }
+}
 .smart-tripo-body{ display:flex; flex-direction:column; gap:8px; padding:10px; height:100%; overflow-y:auto; box-sizing:border-box; font-size:12px; color:var(--text); }
+/* ===== Tripo 工作台 4-Tab（生成/加工/动画/导出）===== */
+.tripo-wb-tabs{ display:flex; gap:4px; }
+.tripo-wb-tabs button{ flex:1; padding:6px 0; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--text); font-size:11px; font-weight:700; cursor:pointer; }
+.tripo-wb-tabs button:hover{ border-color:var(--accent); }
+.tripo-wb-tabs button.active{ background:var(--strong); color:var(--strong-text); border-color:var(--strong); }
+.tripo-wb-pane{ display:none; }
+.tripo-wb-pane.active{ display:flex; flex-direction:column; gap:8px; }
+.tripo-wb-pane .tca-wrap{ margin-top:0; }
+.tripo-wb-needs{ font-size:11px; color:var(--faint); background:var(--soft); border:1px dashed var(--line); border-radius:10px; padding:8px 10px; font-weight:600; line-height:1.5; }
 .tripo-mode-tabs{ display:flex; gap:4px; }
 .tripo-mode-tabs button{ flex:1; padding:5px 0; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--text); font-size:11px; font-weight:700; cursor:pointer; }
 .tripo-mode-tabs button.active{ background:var(--strong); color:var(--strong-text); border-color:var(--strong); }

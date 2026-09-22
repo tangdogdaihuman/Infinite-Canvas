@@ -18,9 +18,13 @@ data/projects.json
 data/storage_settings.json
 data/shared_folders.json
 data/runninghub_workflows.json
+data/tripo_tasks.json
 history.json
 global_config.json
 server_tripo.log
+
+# ---------- 内部交接文档（会话产物，不进公开仓库）----------
+HANDOFF-*.md
 
 # ---------- 素材与生成产物（体积大，且含个人内容）----------
 assets/

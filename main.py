@@ -35,6 +35,13 @@ from io import BytesIO
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
+
+# Tripo 3D 已迁入独立包 providers/tripo（路由薄、协议细节隔离）；此处只挂路由与共享常量
+# 嵌入式 python 的 python310._pth 只含解释器目录，脚本目录不在 sys.path，需显式补入项目根
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from providers.tripo import router as tripo_router
+from providers.tripo import events as tripo_events
+from providers.tripo.config import TRIPO_BASE_URL, normalize_tripo_base_url
 from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
@@ -162,6 +169,21 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
+
+async def broadcast_tripo_task(payload: dict):
+    """把 Tripo 任务进度广播给所有 WS 客户端（providers/tripo 的 watcher 调用）。"""
+    data = json.dumps({"type": "tripo_task", **payload})
+    for connection in manager.active_connections[:]:
+        try:
+            await connection.send_text(data)
+        except Exception as e:
+            print(f"Broadcast tripo task error: {e}")
+            try:
+                manager.active_connections.remove(connection)
+            except ValueError:
+                pass
+
+tripo_events.set_broadcaster(broadcast_tripo_task)
 
 @app.on_event("startup")
 async def startup_event():
@@ -1558,6 +1580,9 @@ async def html_no_cache_middleware(request, call_next):
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
 app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
+
+# Tripo 3D 路由（providers/tripo/router.py）：/api/tripo/{balance,upload,task,task/{id},download}
+app.include_router(tripo_router, prefix="/api/tripo")
 
 # --- Pydantic 模型 ---
 
@@ -12136,273 +12161,6 @@ async def jimeng_status():
 async def jimeng_credit():
     raw = await run_jimeng_cli(["user_credit"], timeout=30)
     return {"success": True, "raw": raw}
-
-# --- Tripo 3D ---
-# Tripo API V3（V2 于 2026-11-01 下线）。国内站与国际站 Key 不通用，base_url 区域必须与 Key 匹配。
-TRIPO_BASE_URL = "https://openapi.tripo3d.com/v3"
-TRIPO_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "tripo")
-os.makedirs(TRIPO_OUTPUT_DIR, exist_ok=True)
-TRIPO_TASK_TYPES = {"text_to_model", "image_to_model", "multiview_to_model", "texture_model", "convert_model", "refine_model"}
-# V3 按能力拆分独立端点，不再使用 POST /task + type 字段
-TRIPO_TASK_ENDPOINTS = {
-    "text_to_model": "/generation/text-to-model",
-    "image_to_model": "/generation/image-to-model",
-    "multiview_to_model": "/generation/multiview-to-model",
-    "texture_model": "/models/texture",
-    "convert_model": "/models/convert",
-    "refine_model": "/models/refine",
-}
-# V3 生成类任务必须显式传 model_version；V2 旧版本号统一回落到官方服务端默认（v3.1）
-TRIPO_GENERATION_TASK_TYPES = {"text_to_model", "image_to_model", "multiview_to_model"}
-TRIPO_DEFAULT_MODEL_VERSION = "v3.1-20260211"
-TRIPO_LEGACY_MODEL_VERSIONS = {
-    "", "default", "v1.3-20240522", "v1.4-20240625", "v2.0-20240919",
-    "turbo-v1.0-20250506", "v2.5-20260210",
-}
-TRIPO_LEGACY_BASE_URLS = {
-    "https://api.tripo3d.com/v2/openapi": "https://openapi.tripo3d.com/v3",
-    "https://api.tripo3d.ai/v2/openapi": "https://openapi.tripo3d.ai/v3",
-}
-# 上游文档存在分歧，这里做一次「参数校验失败自动回退」（400 时才会重试，不会重复建任务、不会重复扣点）：
-# 1) 模型字段名：官方 JS/Go SDK 用 model，V3 文档回显用 model_version；
-# 2) geometry_quality 取值：官方 Changelog 写 detailed，阿里云最新文档写 ultra。
-TRIPO_MODEL_FIELD_ALIASES = ("model_version", "model")
-TRIPO_GEO_QUALITY_ALIASES = {"ultra": "detailed", "detailed": "ultra", "high": "ultra"}
-# models/texture 只接受这两个贴图版本（官方 SDK versions.rs）
-TRIPO_TEXTURE_MODEL_VERSIONS = {"v3.0-20250812", "v2.5-20250123"}
-TRIPO_TEXTURE_QUALITIES = {"standard", "detailed", "extreme"}
-TRIPO_BOOL_PARAMS = ("texture", "pbr", "quad", "auto_size", "smart_low_poly", "generate_parts", "autofix")
-TRIPO_STR_PARAMS = ("texture_quality", "texture_alignment", "orientation", "style", "geometry_quality")
-TRIPO_INT_PARAMS = ("face_limit", "texture_seed")
-
-
-async def tripo_submit_task(client, task_type, body):
-    """提交 Tripo 任务，对上游字段名/取值分歧做一次自动回退。"""
-    url = f"{tripo_base_url()}{TRIPO_TASK_ENDPOINTS[task_type]}"
-    headers = {**tripo_headers(), "Content-Type": "application/json"}
-    attempts = [dict(body)]
-    # 回退 1：geometry_quality 取值别名
-    gq = body.get("geometry_quality")
-    if gq in TRIPO_GEO_QUALITY_ALIASES:
-        alt = dict(body); alt["geometry_quality"] = TRIPO_GEO_QUALITY_ALIASES[gq]
-        attempts.append(alt)
-    # 回退 2：模型字段名 model_version <-> model
-    if "model_version" in body:
-        alt = dict(body); alt["model"] = alt.pop("model_version")
-        attempts.append(alt)
-    resp = None
-    for i, attempt in enumerate(attempts):
-        resp = await client.post(url, headers=headers, json=attempt)
-        if resp.status_code == 200:
-            return resp
-        if resp.status_code != 400:
-            return resp
-        detail = tripo_error_detail(resp).lower()
-        # 只在错误信息确实指向我们正在试的字段时才继续回退
-        relevant = ("geometry_quality" in detail) or ("model" in detail) or ("version" in detail)
-        if not relevant:
-            return resp
-    return resp
-
-def normalize_tripo_base_url(url):
-    """旧 V2 地址自动映射到同区域 V3 端点（国内 .com / 国际 .ai 互不通用）。"""
-    root = str(url or "").strip().rstrip("/")
-    return TRIPO_LEGACY_BASE_URLS.get(root.lower(), root)
-
-def tripo_base_url():
-    """优先使用 API 设置里 Tripo 平台的 base_url（支持国内/国际站切换）。"""
-    try:
-        for p in load_api_providers():
-            if p.get("id") == "tripo" and str(p.get("base_url") or "").strip():
-                return normalize_tripo_base_url(p["base_url"])
-    except Exception:
-        pass
-    return TRIPO_BASE_URL
-
-def tripo_api_key():
-    return (os.environ.get("TRIPO_API_KEY") or "").strip()
-
-def tripo_headers():
-    key = tripo_api_key()
-    if not key:
-        raise HTTPException(status_code=400, detail="未配置 Tripo API Key，请在 API 设置中为 Tripo 3D 平台填写密钥")
-    return {"Authorization": f"Bearer {key}"}
-
-def tripo_error_detail(resp):
-    try:
-        data = resp.json()
-        return data.get("message") or data.get("error") or str(data)[:300]
-    except Exception:
-        return (resp.text or "")[:300]
-
-@app.get("/api/tripo/balance")
-async def tripo_balance():
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(f"{tripo_base_url()}/account/balance", headers=tripo_headers())
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=f"Tripo 余额查询失败：{tripo_error_detail(resp)}")
-    data = resp.json()
-    if data.get("code") not in (0, None):
-        raise HTTPException(status_code=400, detail=f"Tripo 余额查询失败：{data.get('message') or data}")
-    payload = data.get("data") if isinstance(data.get("data"), dict) else data
-    payload = payload or {}
-    return {"success": True, "balance": payload.get("balance"), "frozen": payload.get("frozen"), "raw": payload}
-
-@app.post("/api/tripo/upload")
-async def tripo_upload(payload: dict):
-    name = (payload.get("name") or "image.png").strip() or "image.png"
-    data_b64 = payload.get("data_base64") or ""
-    if data_b64.startswith("data:") and "," in data_b64:
-        data_b64 = data_b64.split(",", 1)[1]
-    try:
-        raw = base64.b64decode(data_b64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="图片数据解码失败")
-    if not raw:
-        raise HTTPException(status_code=400, detail="图片数据为空")
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(f"{tripo_base_url()}/files", headers=tripo_headers(), files={"file": (name, raw)})
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=f"Tripo 图片上传失败：{tripo_error_detail(resp)}")
-    data = resp.json()
-    if data.get("code") != 0:
-        raise HTTPException(status_code=400, detail=f"Tripo 图片上传失败：{data.get('message') or data}")
-    token = (data.get("data") or {}).get("file_token") or (data.get("data") or {}).get("image_token")
-    if not token:
-        raise HTTPException(status_code=400, detail=f"Tripo 上传未返回 file_token：{data}")
-    return {"success": True, "file_token": token}
-
-@app.post("/api/tripo/task")
-async def tripo_create_task(payload: dict):
-    task_type = (payload.get("task_type") or "").strip()
-    if task_type not in TRIPO_TASK_TYPES:
-        raise HTTPException(status_code=400, detail=f"不支持的 Tripo 任务类型：{task_type}")
-    body = {}
-    model_version = (payload.get("model_version") or "").strip()
-    if task_type in TRIPO_GENERATION_TASK_TYPES:
-        if model_version.lower() in TRIPO_LEGACY_MODEL_VERSIONS:
-            model_version = ""
-        body["model_version"] = model_version or TRIPO_DEFAULT_MODEL_VERSION
-    elif model_version:
-        body["model_version"] = model_version
-    file_tokens = payload.get("file_tokens") or []
-    file_types = payload.get("file_types") or []
-    if task_type == "image_to_model":
-        if not file_tokens:
-            raise HTTPException(status_code=400, detail="缺少输入图片")
-        body["file"] = {"type": (file_types[0] if file_types else "png"), "file_token": file_tokens[0]}
-    elif task_type == "multiview_to_model":
-        if len(file_tokens) < 4:
-            raise HTTPException(status_code=400, detail="四视图模式需要 4 张图片（前/后/左/右）")
-        body["files"] = [
-            {"type": (file_types[i] if i < len(file_types) else "png"), "file_token": token}
-            for i, token in enumerate(file_tokens[:4])
-        ]
-        body["ortho_projection"] = bool(payload.get("ortho_projection", True))
-    elif task_type == "text_to_model":
-        prompt = (payload.get("prompt") or "").strip()
-        if not prompt:
-            raise HTTPException(status_code=400, detail="缺少提示词")
-        body["prompt"] = prompt
-        negative = (payload.get("negative_prompt") or "").strip()
-        if negative:
-            body["negative_prompt"] = negative
-    elif task_type in ("texture_model", "convert_model", "refine_model"):
-        original = (payload.get("original_task_id") or "").strip()
-        if not original:
-            raise HTTPException(status_code=400, detail="缺少原始任务 ID")
-        if task_type == "refine_model":
-            body["draft_model_task_id"] = original
-        else:
-            body["original_model_task_id"] = original
-        if task_type == "convert_model":
-            body["format"] = (payload.get("format") or "GLB").strip().upper()
-    stripped = []
-    for key in TRIPO_BOOL_PARAMS:
-        if payload.get(key) is not None:
-            body[key] = bool(payload.get(key))
-    for key in TRIPO_STR_PARAMS:
-        val = payload.get(key)
-        if isinstance(val, str):
-            val = val.strip()
-        if val:
-            body[key] = val
-    for key in TRIPO_INT_PARAMS:
-        if payload.get(key) not in (None, ""):
-            try:
-                body[key] = int(payload.get(key))
-            except (TypeError, ValueError):
-                pass
-    if body.get("texture_quality") and body["texture_quality"] not in TRIPO_TEXTURE_QUALITIES:
-        body["texture_quality"] = "standard"
-    # models/texture 只接受 v3.0 / v2.5 两个贴图版本，其它值直接丢弃（让服务端用默认）
-    if task_type == "texture_model" and body.get("model_version") not in TRIPO_TEXTURE_MODEL_VERSIONS:
-        if body.pop("model_version", None):
-            stripped.append("model_version")
-    # P1 不接受这些几何参数（即使传 false/null 也会被上游拒绝）
-    if str(body.get("model_version") or "").upper().startswith("P1"):
-        for key in ("quad", "smart_low_poly", "generate_parts", "geometry_quality"):
-            if body.pop(key, None) is not None:
-                stripped.append(key)
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await tripo_submit_task(client, task_type, body)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=f"Tripo 任务创建失败：{tripo_error_detail(resp)}")
-    data = resp.json()
-    if data.get("code") != 0:
-        raise HTTPException(status_code=400, detail=f"Tripo 任务创建失败：{data.get('message') or data}")
-    task_id = (data.get("data") or {}).get("task_id")
-    if not task_id:
-        raise HTTPException(status_code=400, detail=f"Tripo 未返回 task_id：{data}")
-    return {"success": True, "task_id": task_id, "request": body, "stripped_params": stripped}
-
-@app.get("/api/tripo/task/{task_id}")
-async def tripo_query_task(task_id: str):
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(f"{tripo_base_url()}/tasks/{task_id}", headers=tripo_headers())
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=f"Tripo 任务查询失败：{tripo_error_detail(resp)}")
-    data = resp.json()
-    if data.get("code") != 0:
-        raise HTTPException(status_code=400, detail=f"Tripo 任务查询失败：{data.get('message') or data}")
-    task = data.get("data") or {}
-    # V3 输出字段名归一化为画布前端读取的键名（model/pbr_model/rendered_image）
-    output = task.get("output")
-    if isinstance(output, dict):
-        model_url = output.get("model_url")
-        if model_url:
-            output.setdefault("model", model_url)
-            output.setdefault("pbr_model", model_url)
-            output.setdefault("base_model", model_url)
-        if output.get("rendered_image_url"):
-            output.setdefault("rendered_image", output["rendered_image_url"])
-        if output.get("generated_image_url"):
-            output.setdefault("generated_image", output["generated_image_url"])
-    if task.get("error_message") and not task.get("error"):
-        task["error"] = task["error_message"]
-    return {"success": True, "task": task}
-
-@app.post("/api/tripo/download")
-async def tripo_download(payload: dict):
-    url = (payload.get("url") or "").strip()
-    if not url.startswith("http"):
-        raise HTTPException(status_code=400, detail="无效的下载地址")
-    kind = re.sub(r"[^a-zA-Z0-9_-]", "", (payload.get("kind") or "model"))[:20] or "model"
-    name_hint = re.sub(r"[^a-zA-Z0-9_-]", "", (payload.get("name") or ""))[:40]
-    ext = ".glb"
-    path_part = url.split("?", 1)[0]
-    tail = path_part.rsplit("/", 1)[-1]
-    if "." in tail:
-        ext = "." + tail.rsplit(".", 1)[-1].lower()[:8]
-    fname = f"tripo_{int(time.time())}_{kind}{('_' + name_hint) if name_hint else ''}{ext}"
-    fpath = os.path.join(TRIPO_OUTPUT_DIR, fname)
-    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-        resp = await client.get(url)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Tripo 文件下载失败")
-    with open(fpath, "wb") as fh:
-        fh.write(resp.content)
-    return {"success": True, "url": f"/output/tripo/{fname}", "name": fname, "size": len(resp.content)}
 
 @app.post("/api/jimeng/logout")
 async def jimeng_logout():

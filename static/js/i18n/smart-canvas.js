@@ -307,5 +307,17 @@
       "smart.tripoStopToast": { zh: "已停止等待，服务端任务仍在继续并会消耗点数", en: "Stopped waiting. The server-side task continues and will still consume credits" },
       "smart.tripoRefine": { zh: "精修", en: "Refine" },
       "smart.tripoRefineHint": { zh: "把草模精修成高精度模型", en: "Refine a draft mesh into a high-detail model" },
+      "smart.tripoImgAssist": { zh: "生图辅助", en: "Image assist" },
+      "smart.tripoImgAssistSummary": { zh: "概念图 / 四视图", en: "Concept & multiview" },
+      "smart.tripoImgAssistDone": { zh: "生成图片已落到画布", en: "Generated image placed on the canvas" },
+      "smart.tripoTaskCenter": { zh: "Tripo 任务中心", en: "Tripo task center" },
+      "smart.tripoTaskRefresh": { zh: "刷新", en: "Refresh" },
+      "smart.tripoTaskEmpty": { zh: "暂无任务记录", en: "No tasks yet" },
+      "smart.tripoTaskLoadError": { zh: "任务列表加载失败", en: "Failed to load tasks" },
+      "smart.tripoTaskLoading": { zh: "加载中…", en: "Loading…" },
+      "smart.tripoWbNeedsModel": { zh: "请先生成 3D 模型", en: "Generate a 3D model first" },
+      "smart.tripoWbMeshHint": { zh: "重贴图 / 精修 / 减面 / 拆件 / 补全 / 风格化", en: "retexture / refine / decimate / segment / complete / stylize" },
+      "smart.tripoWbRigHint": { zh: "绑骨检测 → 自动绑骨 → 动画重定向", en: "rig check → rig → retarget" },
+      "smart.tripoWbExportHint": { zh: "GLB / FBX / OBJ / USDZ / STL 多参数导出", en: "GLB / FBX / OBJ / USDZ / STL export with full options" },
     });
 })();

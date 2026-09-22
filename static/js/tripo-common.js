@@ -288,7 +288,34 @@ async function loadThreeModules(){
     return window.__tripoThreeModules;
 }
 
+/* FBXLoader 约 100KB，只在真的需要预览 FBX 时按需拉取 */
+async function loadFbxModule(){
+    if(window.__tripoFbxModule) return window.__tripoFbxModule;
+    const {FBXLoader} = await import('/static/vendor/js/three-examples/loaders/FBXLoader.js');
+    window.__tripoFbxModule = {FBXLoader};
+    return window.__tripoFbxModule;
+}
+
+/* 按扩展名判定模型格式。
+ * Tripo 在 quad（四边面重拓扑）/ smart_low_poly（智能低模）任务下只产出 FBX
+ * （output.model_url 形如 tripo_poly_<task>.fbx），不能再用 GLTFLoader 解析。 */
+function detectModelFormat(url){
+    const path = String(url || '').split('?')[0];
+    const tail = path.slice(path.lastIndexOf('/') + 1);
+    const ext = tail.includes('.') ? tail.split('.').pop().toLowerCase() : '';
+    if(!ext || ext === 'glb' || ext === 'gltf') return {kind:'gltf', ext:ext || 'glb'};
+    if(ext === 'fbx') return {kind:'fbx', ext};
+    return {kind:'unsupported', ext};
+}
+
+/* 下载按钮上的格式标签：按真实文件后缀显示（FBX / GLB / OBJ …） */
+function modelFormatLabel(url){
+    const fmt = detectModelFormat(url);
+    return String(fmt.ext || 'glb').toUpperCase();
+}
+
 function mountTripoViewer(container, glbUrl, opts={}){
+
     if(!container) return null;
     const prev = viewers.get(container);
     if(prev) prev.dispose();
@@ -333,21 +360,40 @@ function mountTripoViewer(container, glbUrl, opts={}){
         renderer.domElement.style.width = '100%';
         renderer.domElement.style.height = '100%';
 
+        const fmt = detectModelFormat(glbUrl);
         try {
-            const gltf = await new GLTFLoader().loadAsync(glbUrl);
+            let model;
+            if(fmt.kind === 'fbx'){
+                const {FBXLoader} = await loadFbxModule();
+                model = await new FBXLoader().loadAsync(glbUrl);
+            } else if(fmt.kind === 'gltf'){
+                const gltf = await new GLTFLoader().loadAsync(glbUrl);
+                model = gltf.scene || (gltf.scenes || [])[0];
+            } else {
+                const e = new Error(`unsupported:${fmt.ext}`);
+                e.code = 'unsupported';
+                throw e;
+            }
             if(state.disposed) return;
-            const model = gltf.scene;
+            if(!model) throw new Error('empty model');
             const box = new THREE.Box3().setFromObject(model);
             const center = box.getCenter(new THREE.Vector3());
             const size = box.getSize(new THREE.Vector3());
             const radius = Math.max(size.x, size.y, size.z, 0.001);
             model.position.sub(center);
             scene.add(model);
+            /* FBX 常以厘米为单位，包围盒尺度可能远大于 100，near/far 必须跟着半径走，否则被裁掉 */
+            camera.near = Math.max(radius / 100, 0.001);
+            camera.far = Math.max(radius * 100, 100);
+            camera.updateProjectionMatrix();
             camera.position.set(0, radius * 0.6, radius * 1.9);
             controls.target.set(0, 0, 0);
             controls.update();
         } catch(err){
-            container.innerHTML = `<div class="tripo-viewer-fallback">${escapeHtml(tr('tripo.modelLoadFailed') || '模型加载失败')}</div>`;
+            const reason = err?.code === 'unsupported'
+                ? `${String(fmt.ext || '').toUpperCase()} 格式不支持内置预览，可用下方「转换」导出 GLB`
+                : (tr('tripo.modelLoadFailed') || '模型加载失败');
+            container.innerHTML = `<div class="tripo-viewer-fallback">${escapeHtml(reason)}</div>`;
             return;
         }
 
@@ -408,6 +454,8 @@ window.TripoUI = {
     mountBalance: mountTripoBalance,
     refreshBalance: refreshTripoBalance,
     mountViewer: mountTripoViewer,
+    detectModelFormat,
+    modelFormatLabel,
     escapeHtml,
     tr,
     /* 模型目录与估算（画布 UI 直接用） */

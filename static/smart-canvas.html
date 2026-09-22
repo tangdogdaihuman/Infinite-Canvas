@@ -23,7 +23,7 @@
     <script src="/static/js/theme.js?v=2026.08.04.1786152768"></script>
     <script src="/static/js/touch-mouse.js?v=2026.08.04.1786152768"></script>
     <script src="/static/js/i18n.js?v=2026.08.04.1786152768"></script>
-    <link rel="stylesheet" href="/static/css/smart-canvas.css?v=2026.08.04.1789110430">
+    <link rel="stylesheet" href="/static/css/smart-canvas.css?v=2026.08.04.1790104930">
 </head>
 <body>
     <div id="shell" class="shell">
@@ -166,6 +166,7 @@
         <button id="smartLogToggle" class="smart-log-toggle" type="button" onclick="openSmartCanvasLog()" title="日志" aria-label="日志" data-i18n-title="canvas.logs"><i data-lucide="list-todo"></i><span data-i18n="canvas.logs">日志</span></button>
         <button id="assetToggle" class="asset-toggle" type="button"><i data-lucide="library"></i><span data-i18n="smart.assetLibrary">资产库</span></button>
         <button id="tripoBalanceSmart" class="tripo-balance-smart" type="button" title="Tripo 余额"></button>
+        <button id="tripoTasksSmart" class="tripo-tasks-smart" type="button" title="Tripo 任务中心" aria-label="Tripo 任务中心"><i data-lucide="list-checks"></i><span>任务</span></button>
         <aside id="smartWorkflowTransferModal" class="workflow-transfer-panel">
             <div class="workflow-transfer-head">
                 <div>
@@ -461,7 +462,10 @@
         <div id="toast" class="toast"></div>
         <div id="mentionPreview" class="mention-preview"><img alt="preview"></div>
     </div>
-    <script src="/static/js/tripo-common.js?v=2026.08.04.1789112002"></script>
-    <script src="/static/js/smart-canvas.js?v=2026.08.04.1789112038"></script>
+    <script src="/static/js/tripo-common.js?v=2026.08.04.1790071040"></script>
+    <script src="/static/js/tripo/preview-modal.js?v=2026.08.04.1790098392"></script>
+    <script src="/static/js/tripo/capability-actions.js?v=2026.08.04.1790106774"></script>
+    <script src="/static/js/tripo/task-center.js?v=2026.08.04.1790104667"></script>
+    <script src="/static/js/smart-canvas.js?v=2026.08.04.1790106794"></script>
 </body>
 </html>
